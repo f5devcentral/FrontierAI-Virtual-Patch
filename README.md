@@ -1,6 +1,6 @@
-# virtual-patch-copilot
+# frontierai-virtual-patch
 
-[![CI](https://github.com/henleda/virtual-patch-copilot/actions/workflows/ci.yml/badge.svg)](https://github.com/henleda/virtual-patch-copilot/actions/workflows/ci.yml)
+[![CI](https://github.com/f5devcentral/frontierai-virtual-patch/actions/workflows/ci.yml/badge.svg)](https://github.com/f5devcentral/frontierai-virtual-patch/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 ![Python](https://img.shields.io/badge/python-3.10%E2%80%933.12-blue.svg)
 
