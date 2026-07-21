@@ -1,4 +1,4 @@
-# frontierai-virtual-patch
+# FrontierAI-Virtual-Patch
 
 [![CI](https://github.com/f5devcentral/frontierai-virtual-patch/actions/workflows/ci.yml/badge.svg)](https://github.com/f5devcentral/frontierai-virtual-patch/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
