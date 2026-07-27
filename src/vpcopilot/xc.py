@@ -68,6 +68,20 @@ class XC:
     def delete_service_policy(self, name: str) -> dict:
         return self._req("DELETE", f"/config/namespaces/{self.ns}/service_policys/{name}")
 
+    # --- user identifications (key per-user controls on a header, not client IP) ---
+    def get_user_identification(self, name: str) -> dict:
+        return self._req("GET", f"/config/namespaces/{self.ns}/user_identifications/{name}")
+
+    def create_user_identification(self, obj: dict) -> dict:
+        return self._req("POST", f"/config/namespaces/{self.ns}/user_identifications", json=obj)
+
+    def user_identification_exists(self, name: str) -> bool:
+        try:
+            self.get_user_identification(name)
+            return True
+        except XCError:
+            return False
+
     # --- http load balancer ---
     def list_http_loadbalancers(self) -> dict:
         # `?report_fields=` makes the collection GET embed each LB's full spec under `get_spec`
@@ -76,6 +90,25 @@ class XC:
 
     def get_lb(self, name: str) -> dict:
         return self._req("GET", f"/config/namespaces/{self.ns}/http_loadbalancers/{name}")
+
+    # --- request logs (G2: read-only; the ONLY /data endpoint this client touches) ---
+    def access_logs(self, *, start: str, end: str, limit: int = 500, lb: str | None = None) -> list[dict]:
+        """Observed requests from the tenant, for shadow simulation. `start`/`end` are RFC3339
+        (`2026-07-27T15:00:00Z`) — XC rejects relative times like `now-1h`. Optionally scoped to
+        one LB via its virtual-host name. Records carry no request body; see `traffic.py`."""
+        body = {"start_time": start, "end_time": end, "limit": int(limit), "scroll": False}
+        if lb:
+            body["query"] = f'{{vh_name="ves-io-http-loadbalancer-{lb}"}}'
+        res = self._req("POST", f"/data/namespaces/{self.ns}/access_logs", json=body)
+        out = []
+        for row in res.get("logs") or []:
+            if isinstance(row, str):
+                try:
+                    row = json.loads(row)
+                except json.JSONDecodeError:
+                    continue          # one unparseable row must not lose the rest of the window
+            out.append(row)
+        return out
 
     def put_lb(self, name: str, obj: dict) -> dict:
         return self._req("PUT", f"/config/namespaces/{self.ns}/http_loadbalancers/{name}", json=obj)

@@ -60,15 +60,40 @@ def scan(
 
 @app.command()
 def bench(
-    repo: str = typer.Argument(..., help="app dir to scan (e.g. the vuln-lab api dir)"),
+    repo: str = typer.Argument(..., help="app dir to scan (e.g. bench/fixtures/nimbus-vuln-lab/app/src/app/api)"),
     key: str = typer.Option("bench/answer_key.yaml", help="answer key path"),
     out: str = typer.Option("out", help="output directory"),
     config: str = typer.Option(None, "--config", help="path to agents.yaml"),
     rescore: bool = typer.Option(False, "--rescore", help="score the existing out/ without re-scanning"),
+    all_configs: bool = typer.Option(False, "--all-configs",
+                                     help="score EVERY config/agents*.yaml and write benchmarks/RESULTS.md"),
+    target: str = typer.Option(None, "--target", help="label for the scorecard (default: the repo path)"),
+    skip: list[str] = typer.Option(None, "--skip", help="config tag to skip, repeatable (e.g. --skip dgx)"),
     min_confidence: float = typer.Option(0.5, "--min-confidence", help="drop verified findings below this confidence"),
     concurrency: int = typer.Option(8, "--concurrency", help="parallel workers for discover/verify"),
 ):
     """Run the scan and SCORE it against the answer key (discovery, triage, cure)."""
+    if all_configs:
+        from .scorecard import run_all_configs, write_results
+        skipped = tuple(skip or ())
+        res = run_all_configs(repo, key=key, min_confidence=min_confidence, concurrency=concurrency,
+                              rescore=rescore, skip=skipped, log=lambda m: rprint(f"[dim]{m}[/dim]"))
+        t = Table(title="model scorecard")
+        for c in ["config", "model", "recall", "precision", "triage", "noise", "wall"]:
+            t.add_column(c)
+        for tag in sorted(res):
+            r = res[tag]
+            if r.get("error"):
+                t.add_row(tag, r.get("model", "?"), "[red]failed[/red]", "", "", "", "")
+                continue
+            sc = r["score"]
+            t.add_row(tag, r["model"], f"{sc['discovery_recall']:.2f}", f"{sc['verify_precision']:.2f}",
+                      f"{sc['triage_accuracy']:.2f}", str(sc["noise"]), f"{sc['wall_time_s']:.0f}s")
+        rprint(t)
+        path = write_results(res, target=target or repo, key=key, skipped=skipped)
+        rprint(f"wrote [bold]{path}[/bold]")
+        return
+
     from .bench import run_bench
 
     res = run_bench(repo, key, out_dir=out, config_path=config, scan=not rescore,
@@ -131,6 +156,7 @@ def apply(
     probe_pass: str = typer.Option(None, "--probe-pass", help="validation login password (or VPCOPILOT_PROBE_PASS)"),
     probe_login_path: str = typer.Option(None, "--probe-login-path", help="login endpoint path, default /api/login (or VPCOPILOT_PROBE_LOGIN_PATH)"),
     probe_token: str = typer.Option(None, "--probe-token", help="bearer token for validation instead of user/pass (or VPCOPILOT_PROBE_TOKEN)"),
+    finding: str = typer.Option(None, "--finding", help="finding id whose probe (out/probes.json) validates this policy; overrides the ledger lookup"),
     out: str = typer.Option("out", help="output directory"),
 ):
     """Gated apply: (create from scan) -> snapshot -> self-test -> attach -> validate -> refine/rollback."""
@@ -142,12 +168,13 @@ def apply(
         if flag:
             os.environ[key] = flag
     logf = lambda m: rprint(f"[dim]{m}[/dim]")  # noqa: E731
-    kw = dict(dry_run=dry_run, keep=keep, allow_protected=allow_protected_lb, probe=probe, out_dir=out, log=logf)
+    kw = dict(dry_run=dry_run, keep=keep, allow_protected=allow_protected_lb, probe=probe,
+              finding_id=finding, out_dir=out, log=logf)
     if from_scan and refine and not dry_run and not create_only:
         from .refiner import refine_apply_service_policy
         res = refine_apply_service_policy(from_scan, lb, url, name=name, keep=keep,
                                           allow_protected=allow_protected_lb, max_refine=refine_attempts,
-                                          out_dir=out, log=logf)
+                                          finding_id=finding, out_dir=out, log=logf)
     elif from_scan:
         from .apply import apply_from_scan
         res = apply_from_scan(from_scan, lb, url, name=name, create_only=create_only, **kw)
@@ -164,13 +191,17 @@ def apply_maluser(
     dry_run: bool = typer.Option(False, "--dry-run", help="no mutation; show current + would-be change"),
     keep: bool = typer.Option(False, "--keep", help="leave detection enabled (default: rollback)"),
     allow_protected_lb: bool = typer.Option(False, "--allow-protected-lb", help="permit mutating a protected LB"),
+    user_id_header: str = typer.Option(None, "--user-id-header", help="key detection on this request header (e.g. X-Agent-Id) instead of client IP"),
+    user_id_name: str = typer.Option(None, "--user-id-name", help="user_identification object name (default <lb>-user-id)"),
     out: str = typer.Option("out", help="output directory"),
 ):
     """Enable XC Malicious-User Detection on an LB (behavioral control; config-level validation)."""
     from .apply import apply_malicious_user
 
     res = apply_malicious_user(lb, dry_run=dry_run, keep=keep, allow_protected=allow_protected_lb,
-                              finding_id=finding, out_dir=out, log=lambda m: rprint(f"[dim]{m}[/dim]"))
+                              finding_id=finding, user_id_header=user_id_header,
+                              user_identification_name=user_id_name,
+                              out_dir=out, log=lambda m: rprint(f"[dim]{m}[/dim]"))
     rprint(Panel.fit("\n".join(f"[bold]{k}[/bold]: {v}" for k, v in res.items()), title="apply-maluser"))
 
 
@@ -181,7 +212,11 @@ def apply_ratelimit(
     unit: str = typer.Option("MINUTE", help="SECOND | MINUTE | HOUR"),
     burst: int = typer.Option(1, help="burst multiplier (>0)"),
     behavioral: bool = typer.Option(False, "--behavioral", help="B3: drive a burst + confirm 429s (not just config)"),
+    behavioral_path: str = typer.Option("/login", "--behavioral-path", help="path to burst for --behavioral (use the rate-limited endpoint)"),
     url: str = typer.Option("https://lab.banknimbus.com", help="live host for the behavioral burst"),
+    user_id_header: str = typer.Option(None, "--user-id-header", help="key the limit per this request header (e.g. X-Agent-Id) instead of LB-wide"),
+    user_id_name: str = typer.Option(None, "--user-id-name", help="user_identification object name (default <lb>-user-id)"),
+    burst_header: list[str] = typer.Option(None, "--burst-header", help="header sent on every behavioral burst request, name=value (repeatable)"),
     finding: str = typer.Option(None, "--finding", help="link to a finding id for the ledger"),
     dry_run: bool = typer.Option(False, "--dry-run"),
     keep: bool = typer.Option(False, "--keep", help="leave enabled on success (default: rollback)"),
@@ -191,7 +226,15 @@ def apply_ratelimit(
     """Enable XC rate limiting on an LB (config validation + rollback; --behavioral drives traffic)."""
     from .apply import apply_rate_limit
 
+    burst_headers = {}
+    for h in (burst_header or []):
+        if "=" in h:
+            k, v = h.split("=", 1)
+            burst_headers[k.strip()] = v.strip()
+
     res = apply_rate_limit(lb, requests=requests, unit=unit, burst=burst, behavioral=behavioral,
+                           behavioral_path=behavioral_path, burst_headers=burst_headers or None,
+                           user_id_header=user_id_header, user_identification_name=user_id_name,
                            target_url=url, finding_id=finding, dry_run=dry_run, keep=keep,
                            allow_protected=allow_protected_lb, out_dir=out,
                            log=lambda m: rprint(f"[dim]{m}[/dim]"))
@@ -237,6 +280,8 @@ def apply_waf_cmd(
 @app.command(name="apply-dataguard")
 def apply_dataguard_cmd(
     lb: str = typer.Option("vpcopilot-lab", help="HTTP LB name"),
+    app_firewall: str = typer.Option("vpcopilot-lab-waf", help="app_firewall to ensure (created Blocking if missing); an already-attached, differently-named WAF is reused, never clobbered"),
+    template: str = typer.Option("nimbus-waf", help="app_firewall to clone for the Blocking WAF"),
     finding: str = typer.Option(None, "--finding", help="link to a finding id for the ledger"),
     dry_run: bool = typer.Option(False, "--dry-run"),
     keep: bool = typer.Option(False, "--keep", help="leave Data Guard on (default: rollback)"),
@@ -246,7 +291,8 @@ def apply_dataguard_cmd(
     """Enable WAF Data Guard on an LB (mask sensitive data in responses; config validation)."""
     from .apply import apply_data_guard
 
-    res = apply_data_guard(lb, finding_id=finding, dry_run=dry_run, keep=keep,
+    res = apply_data_guard(lb, app_firewall=app_firewall, template=template, finding_id=finding,
+                           dry_run=dry_run, keep=keep,
                            allow_protected=allow_protected_lb, out_dir=out,
                            log=lambda m: rprint(f"[dim]{m}[/dim]"))
     rprint(Panel.fit("\n".join(f"[bold]{k}[/bold]: {v}" for k, v in res.items()), title="apply-dataguard"))
@@ -257,6 +303,10 @@ def apply_apischema_cmd(
     lb: str = typer.Option("vpcopilot-lab", help="HTTP LB name"),
     url: str = typer.Option("https://lab.banknimbus.com", help="live host to validate against"),
     openapi_file: str = typer.Option(None, "--openapi-file", help="OpenAPI/Swagger JSON to enforce (default: built-in Nimbus spec)"),
+    validate_properties: str = typer.Option(
+        "PROPERTY_HTTP_HEADERS,PROPERTY_QUERY_PARAMETERS,PROPERTY_HTTP_BODY", "--validate-properties",
+        help="comma-separated request parts XC validates against the spec (default: headers, query "
+             "params and body — body-only enforces nothing on a bodyless GET)"),
     finding: str = typer.Option(None, "--finding", help="link to a finding id for the ledger"),
     dry_run: bool = typer.Option(False, "--dry-run"),
     keep: bool = typer.Option(False, "--keep", help="leave validation enabled on success (default: rollback)"),
@@ -271,7 +321,9 @@ def apply_apischema_cmd(
     from .apply import apply_api_schema
 
     openapi = _json.loads(_Path(openapi_file).read_text()) if openapi_file else None
+    props = [p.strip() for p in (validate_properties or "").split(",") if p.strip()] or None
     res = apply_api_schema(lb, openapi=openapi, target_url=url, finding_id=finding, dry_run=dry_run,
+                           request_validation_properties=props,
                            keep=keep, allow_protected=allow_protected_lb, out_dir=out,
                            log=lambda m: rprint(f"[dim]{m}[/dim]"))
     rprint(Panel.fit("\n".join(f"[bold]{k}[/bold]: {v}" for k, v in res.items()), title="apply-apischema"))
@@ -405,6 +457,137 @@ def audit(out: str = typer.Option("out", help="output directory")):
         detail = ", ".join(f"{k}={v}" for k, v in e.items() if k not in ("ts", "action"))
         t.add_row(e.get("ts", ""), e.get("action", ""), detail)
     rprint(t)
+
+
+@app.command()
+def simulate(
+    out: str = typer.Option("out", help="run directory holding the generated policies"),
+    logs: str = typer.Option(None, "--logs", help="traffic sample: .har / .json (HAR) or .jsonl"),
+    from_tenant: bool = typer.Option(False, "--from-tenant", help="read observed requests from XC access logs"),
+    lb: str = typer.Option("vpcopilot-lab", help="spare LB to replay through (never a protected one)"),
+    url: str = typer.Option("https://lab.banknimbus.com", help="base URL of that LB"),
+    source_lb: str = typer.Option(None, "--source-lb", help="with --from-tenant: the LB whose traffic to read"),
+    since: str = typer.Option("1h", "--since", help="with --from-tenant: window back from now, e.g. 30m / 6h"),
+    limit: int = typer.Option(500, help="max records to pull from the tenant"),
+    max_records: int = typer.Option(200, help="max records to actually replay (each is one live request)"),
+    threshold: float = typer.Option(None, help="would-block rate that flags a policy (default 0.01)"),
+    policy: str = typer.Option(None, "--policy", help="simulate only this policy"),
+):
+    """Replay a recorded traffic sample against each generated band-aid and report what it WOULD
+    block, before anything reaches the gate. Read-only against the sample; the spare LB is
+    snapshotted and restored."""
+    import os
+    from .simulate import DEFAULT_THRESHOLD, candidates_from_out, simulate_policies, write_result
+
+    cands = candidates_from_out(out, policy)
+    if not cands:
+        rprint(f"[yellow]no service_policy artifacts in {out} — nothing to simulate[/yellow]")
+        raise typer.Exit(code=1)
+
+    records, redacted, src, window = _load_traffic(logs, from_tenant, source_lb or lb, since, limit)
+    if not records:
+        rprint("[yellow]no records ingested — supply --logs or --from-tenant[/yellow]")
+        raise typer.Exit(code=1)
+    rprint(f"[dim]{len(records)} record(s) from {src}"
+           + (f"; redacted {sum(v for k, v in redacted.items() if not k.startswith('_'))} value(s)" if redacted else "")
+           + "[/dim]")
+
+    thr = threshold if threshold is not None else float(os.environ.get("VPCOPILOT_SIM_THRESHOLD", DEFAULT_THRESHOLD))
+    res = simulate_policies(cands, records, lb=lb, url=url, out_dir=out, threshold=thr,
+                            max_records=max_records, source=src, window=window, redacted=redacted,
+                            log=lambda m: rprint(f"[dim]{m}[/dim]"))
+    path = write_result(out, res)
+    t = Table(title="blast radius")
+    for c in ["policy", "evaluated", "would block", "rate", "verdict"]:
+        t.add_column(c)
+    for p in res.policies:
+        verdict = ("[red]over threshold[/red]" if p.blocked_promotion
+                   else ("[yellow]error[/yellow]" if p.error else "[green]ok[/green]"))
+        t.add_row(p.policy_name, str(p.evaluated), str(p.would_block), f"{p.block_rate:.1%}", verdict)
+    rprint(t)
+    rprint(f"wrote [bold]{path}[/bold]")
+
+
+def _load_traffic(logs, from_tenant, source_lb, since, limit):
+    """Traffic comes from a file, the tenant, or both — the two sources are additive on purpose:
+    a HAR carries bodies the access logs cannot."""
+    import datetime as _dt
+
+    from . import traffic
+    records, redacted, srcs = [], {}, []
+    window = ""
+    if logs:
+        recs, red = traffic.load(logs)
+        records += recs
+        redacted.update(red)
+        srcs.append(f"file:{logs}")
+    if from_tenant:
+        from .xc import XC
+        n = int("".join(ch for ch in since if ch.isdigit()) or 1)
+        unit = since.strip()[-1].lower()
+        delta = _dt.timedelta(**{{"m": "minutes", "h": "hours", "d": "days"}.get(unit, "hours"): n})
+        now = _dt.datetime.now(_dt.timezone.utc)
+        start, end = now - delta, now
+        rows = XC().access_logs(start=start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                                end=end.strftime("%Y-%m-%dT%H:%M:%SZ"), limit=limit, lb=source_lb)
+        recs, red = traffic.from_xc_logs(rows, lb=source_lb)
+        records += recs
+        for k, v in red.items():
+            redacted[k] = redacted.get(k, 0) + v
+        srcs.append(f"xc:{source_lb}")
+        window = f"{start:%Y-%m-%dT%H:%M:%SZ}..{end:%Y-%m-%dT%H:%M:%SZ}"
+    return records, redacted, " + ".join(srcs), window
+
+
+@app.command()
+def export(
+    out: str = typer.Option("out", help="run directory to export"),
+    output: str = typer.Option(None, "--output", help="bundle path (default: <out>/audit-bundle.zip)"),
+    all_runs: bool = typer.Option(False, "--all", help="bundle every run dir on disk, each in its own folder"),
+    root: str = typer.Option(".", help="where to look for run dirs when --all is used"),
+    verify: str = typer.Option(None, "--verify", help="check an existing bundle instead of writing one"),
+    pubkey: str = typer.Option(None, "--pubkey", help="minisign public key, to check the signature too"),
+):
+    """Export the audit evidence bundle for a run: every change made to a load balancer, the finding
+    that justified it, the exact XC config pushed, and the pre-change snapshot — with a manifest that
+    SHA-256s every member. Same bundle the console's Retire step downloads."""
+    from .export import build_audit_events, verify_bundle, write_bundle, write_bundle_all
+
+    if verify:
+        r = verify_bundle(verify, pubkey=pubkey, log=lambda m: rprint(f"[dim]{m}[/dim]"))
+        if r["error"]:
+            rprint(f"[red]{r['error']}[/red]")
+            raise typer.Exit(code=1)
+        t = Table(title=f"verify {verify}")
+        for c in ["run", "run id", "members", "signature"]:
+            t.add_column(c)
+        sig_style = {"verified": "green", "failed": "red", "absent": "dim",
+                     "present-unverified": "yellow"}
+        for run in r["runs"]:
+            st = sig_style.get(run["signature"], "")
+            t.add_row(run["run"], run["run_id"] or "—", str(run["members"]),
+                      f"[{st}]{run['signature']}[/{st}]" if st else run["signature"])
+        rprint(t)
+        for pb in r["problems"]:
+            rprint(f"  [red]{pb['problem'].upper()}[/red] {pb['run']}{pb['member']} — {pb['detail']}")
+        if r["ok"]:
+            rprint(f"[green]OK[/green] — {r['members_checked']} member digest(s) match the manifest")
+            if any(run["signature"] == "present-unverified" for run in r["runs"]):
+                rprint("[yellow]note:[/yellow] a signature is present but was not checked — "
+                       "pass --pubkey with the signer's key, obtained out of band")
+            return
+        rprint(f"[red]FAILED[/red] — {len(r['problems'])} problem(s)")
+        raise typer.Exit(code=1)
+
+    if all_runs:
+        path = write_bundle_all(root, output)
+        rprint(f"wrote [bold]{path}[/bold] (all runs under {root})")
+        return
+    events = build_audit_events(out)
+    if not events:
+        rprint(f"[yellow]no audit entries in {out} — nothing has changed a load balancer yet[/yellow]")
+    path = write_bundle(out, output)
+    rprint(f"wrote [bold]{path}[/bold] · {len(events)} audit event(s)")
 
 
 @app.command()

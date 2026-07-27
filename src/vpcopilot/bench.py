@@ -30,6 +30,55 @@ COMPAT = {
 }
 
 
+def _policy_quality(out: Path) -> tuple[int, int]:
+    """(generated, lint-flagged) over the policies a run actually emitted.
+
+    Beyond the stated G4 acceptance, and added because the first real four-way run proved the table
+    would otherwise mislead: one model scored precision 1.00 and triage 1.00 while emitting `{}` as
+    the spec for three of its policies. Recall, precision and triage all say the routing was right;
+    none of them notice that the artifact is unusable. This reuses `lint_generated_spec`, which the
+    pipeline already runs — no new judgement, just a count that reaches the scorecard.
+
+    Counted from THIS run's `policies.json` index, not from the files on disk: a re-scan into an
+    existing out dir leaves the previous run's artifacts in `policies/` (32 files for 9 generated
+    policies, on the run that surfaced this), so globbing the directory would score a model against
+    someone else's leftovers."""
+    from .apply import artifact_spec, lint_generated_spec
+    idx = out / "policies.json"
+    if not idx.exists():
+        return 0, 0
+    try:
+        entries = json.loads(idx.read_text())
+    except json.JSONDecodeError:
+        return 0, 0
+    total = flagged = 0
+    for a in entries:
+        control, name = a.get("control", ""), a.get("policy_name", "")
+        f = out / "policies" / f"{control}.{name}.json"
+        total += 1
+        if not f.exists():
+            flagged += 1
+            continue
+        try:
+            spec = artifact_spec(json.loads(f.read_text()))
+        except json.JSONDecodeError:
+            flagged += 1
+            continue
+        if lint_generated_spec(control, spec, None):
+            flagged += 1
+    return total, flagged
+
+
+def _precision(*, used: int, verified: int) -> float:
+    """Verify precision — the false-positive filter rate the old `BACKLOG.md` item asked for.
+
+    Real over reported: a verified finding that matched a key entry or a bonus entry is real,
+    everything else the verifier let through is noise. Distinct from `discovery_recall`, which asks
+    whether the KNOWN vulns were found — a run can ace one and fail the other, which is exactly why
+    both belong in the scorecard."""
+    return round(used / verified, 2) if verified else 0.0
+
+
 def _tail(path: str) -> str:
     return path.split("/api/", 1)[-1] if "/api/" in path else path
 
@@ -101,6 +150,14 @@ def run_bench(repo, key_path, out_dir="out", config_path=None, log: Callable = p
     found = sum(r["found"] for r in rows)
     triage_correct = sum(1 for r in rows if r["triage_ok"])
     noise = [f["id"] for f in verified if f["id"] not in used]
+    metrics = {}
+    mp = out / "metrics.json"
+    if mp.exists():
+        try:
+            metrics = json.loads(mp.read_text())
+        except json.JSONDecodeError:
+            metrics = {}
+    pol_total, pol_flagged = _policy_quality(out)
     score = {
         "expected": n,
         "found": found,
@@ -110,5 +167,11 @@ def run_bench(repo, key_path, out_dir="out", config_path=None, log: Callable = p
         "bonus_found": bonus_found,
         "bonus_total": len(bonus),
         "noise": len(noise),
+        "verified": len(verified),
+        "verify_precision": _precision(used=len(used), verified=len(verified)),
+        "duplicates_dropped": (metrics.get("discovery") or {}).get("duplicates_dropped", 0),
+        "policies": pol_total,
+        "policies_flagged": pol_flagged,
+        "wall_time_s": (metrics.get("timing_s") or {}).get("total", 0.0),
     }
     return {"rows": rows, "score": score, "noise": noise}

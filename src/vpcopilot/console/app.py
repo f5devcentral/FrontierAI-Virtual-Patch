@@ -7,11 +7,13 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
+from datetime import datetime, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
@@ -71,6 +73,18 @@ app = FastAPI(title="virtual-patch-copilot console")
 load_dotenv(ENV_PATH)
 _scan = {"state": "idle", "log": [], "summary": None, "error": None}
 
+LOG_MAX = 20_000  # the log endpoints serve the FULL transcript now — keep a ceiling on what one run pins in memory
+
+
+def _append(buf: list, msg: str) -> None:
+    """Bounded log sink. A scan/apply used to be served as a truncated tail, so an unbounded buffer
+    never mattered; now the console streams the whole transcript, so cap it — and say so in-band
+    rather than silently dropping the rest."""
+    if len(buf) < LOG_MAX:
+        buf.append(msg)
+    elif len(buf) == LOG_MAX:
+        buf.append(f"… log capped at {LOG_MAX} lines — further output suppressed (artifacts are still written to the out dir)")
+
 
 # ---------------- helpers ----------------
 def _read_env() -> dict:
@@ -115,6 +129,13 @@ def _rj(name: str, default):
     return json.loads(p.read_text()) if p.exists() else default
 
 
+def _stamped_name(kind: str, ext: str) -> str:
+    """`vpcopilot-<kind>-<run dir>-<UTC>.<ext>` — a downloaded artifact has to say which run it came
+    from and when, so several of them can sit in one folder (or one ticket) without ambiguity."""
+    run = re.sub(r"[^A-Za-z0-9]+", "-", str(OUT)).strip("-") or "run"
+    return f"vpcopilot-{kind}-{run}-{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}.{ext}"
+
+
 # ---------------- read endpoints ----------------
 @app.get("/api/results")
 def results():
@@ -140,6 +161,117 @@ def ledger():
 def audit():
     from ..audit import load
     return load(str(OUT))
+
+
+@app.get("/api/audit-events")
+def audit_events():
+    """F3: the audit log normalized into one shape per event and joined to the ledger + findings, so
+    the Retire step can SHOW the trail — every change made to a load balancer, and the vulnerability
+    that justified it — before anyone exports it. Seeing it first is what makes the export
+    trustworthy: you can check what leaves the machine."""
+    from ..export import build_audit_events
+    return {"out": str(OUT), "events": build_audit_events(str(OUT))}
+
+
+@app.get("/api/simulate")
+def simulation():
+    """G2: the last blast-radius result for this run — what each candidate band-aid WOULD block,
+    measured by replaying a recorded sample through a spare LB. Empty until a simulation runs;
+    the Simulate step reads this to render before anything reaches the gate."""
+    from ..simulate import load_result
+    return {"out": str(OUT), "simulation": load_result(str(OUT))}
+
+
+class SimReq(BaseModel):
+    logs: str | None = None            # HAR / JSONL path
+    from_tenant: bool = False          # read observed requests from XC access logs
+    lb: str = "vpcopilot-lab"          # the spare LB to replay through
+    url: str = "https://lab.banknimbus.com"
+    source_lb: str | None = None       # whose traffic to read, when from_tenant
+    since: str = "1h"
+    limit: int = 500
+    max_records: int = 200
+    threshold: float | None = None
+    policy: str | None = None
+
+
+@app.post("/api/simulate")
+def run_simulation(body: SimReq):
+    """Run a replay in the background, streaming through the same job contract as apply — the
+    console polls /api/action?job=… for the log."""
+    import uuid
+    load_dotenv(ENV_PATH, override=True)
+    job_id = uuid.uuid4().hex[:8]
+    _jobs[job_id] = {"state": "running", "log": [], "result": None, "error": None,
+                     "control": "simulate", "finding_id": None}
+    threading.Thread(target=_run_simulation, args=(job_id, body), daemon=True).start()
+    return {"job": job_id, "state": "running"}
+
+
+def _run_simulation(job_id: str, body: SimReq):
+    job = _jobs[job_id]
+    log = lambda m: _append(job["log"], m)  # noqa: E731
+    try:
+        import os
+
+        from ..cli import _load_traffic
+        from ..simulate import DEFAULT_THRESHOLD, candidates_from_out, simulate_policies, write_result
+        cands = candidates_from_out(str(OUT), body.policy)
+        if not cands:
+            raise RuntimeError(f"no service_policy artifacts in {OUT} — run a scan first")
+        records, redacted, src, window = _load_traffic(
+            body.logs, body.from_tenant, body.source_lb or body.lb, body.since, body.limit)
+        if not records:
+            raise RuntimeError("no records ingested — give a traffic file or enable from-tenant")
+        log(f"{len(records)} record(s) from {src}")
+        thr = body.threshold if body.threshold is not None else float(
+            os.environ.get("VPCOPILOT_SIM_THRESHOLD", DEFAULT_THRESHOLD))
+        res = simulate_policies(cands, records, lb=body.lb, url=body.url, out_dir=str(OUT),
+                                threshold=thr, max_records=body.max_records, source=src,
+                                window=window, redacted=redacted, log=log)
+        write_result(str(OUT), res)
+        job.update(state="done", result=res.model_dump())
+    except Exception as e:  # noqa: BLE001
+        job.update(state="error", error=str(e))
+
+
+@app.get("/api/runs")
+def runs():
+    """Run dirs on disk that have something to export — backs the Retire step's 'all runs' bundle."""
+    from ..export import find_runs
+    return {"current": str(OUT), "runs": find_runs(".")}
+
+
+@app.get("/api/audit-verify")
+def audit_verify():
+    """J2: check the bundle this run last wrote (`<out>/audit-bundle.zip`) against its own manifest.
+
+    The path comes from server state, never from the request. A verify endpoint that took a
+    caller-supplied path would be an arbitrary-file reader, and localhost is not a reason to ship
+    one. Verifying a bundle that has already left the machine is the CLI's job — that is where the
+    reviewer is."""
+    from ..export import verify_bundle
+    p = OUT / "audit-bundle.zip"
+    if not p.exists():
+        return {"bundle": str(p), "exists": False,
+                "hint": "run `vpcopilot export` (or the Retire step's download) first"}
+    return {"bundle": str(p), "exists": True,
+            **verify_bundle(str(p), pubkey=os.environ.get("VPCOPILOT_MINISIGN_PUBKEY"))}
+
+
+@app.get("/api/audit-export")
+def audit_export(scope: str = "run"):
+    """F3: download the evidence bundle — `scope=run` for the run the console is reading, `scope=all`
+    for every run dir on disk (each in its own folder, under a top-level index). A .zip because the
+    evidence is plural: the normalized events, the raw append-only log verbatim, the exact XC configs
+    that were pushed, the pre-change LB snapshots, and a manifest that SHA-256s every member."""
+    from ..export import bundle_all_bytes, bundle_bytes
+    if scope not in ("run", "all"):
+        raise HTTPException(400, f"unknown scope '{scope}' (use 'run' or 'all')")
+    data = bundle_bytes(str(OUT)) if scope == "run" else bundle_all_bytes(".")
+    name = _stamped_name("audit", "zip") if scope == "run" else _stamped_name("audit-all", "zip")
+    return Response(content=data, media_type="application/zip",
+                    headers={"content-disposition": f'attachment; filename="{name}"'})
 
 
 AGENT_ROLES = {
@@ -281,11 +413,16 @@ def build_benchmark(body: BenchReq):
 
 
 @app.get("/api/report")
-def report_html():
-    """Build + serve the standalone HTML report (E3) for the current out/ dir."""
+def report_html(download: bool = False):
+    """Build + serve the standalone HTML report (E3) for the current out/ dir. It is REBUILT on every
+    request, so whoever opens it always gets the latest run — which is why Review links straight to
+    it rather than to a stale file on disk (F2). `download=1` names the file and sends it as an
+    attachment (the report is meant to be shared); the default stays inline for the new-tab view."""
     from ..report import write_report
     path = write_report(str(OUT), str(OUT / "report.html"))
-    return FileResponse(path, media_type="text/html")
+    if not download:
+        return FileResponse(path, media_type="text/html")
+    return FileResponse(path, media_type="text/html", filename=_stamped_name("report", "html"))
 
 
 @app.get("/api/defaults")
@@ -405,7 +542,7 @@ def _run_scan(repo: str, out: str, min_confidence: float = 0.5,
         from ..pipeline import run_pipeline
         summary = run_pipeline(repo, out_dir=out, config_path=_active_config, min_confidence=min_confidence,
                                max_files=max_files, max_bytes=max_bytes, draft_code_fixes=draft_code_fixes,
-                               log=lambda m: _scan["log"].append(m))
+                               log=lambda m: _append(_scan["log"], m))
         _scan.update(state="done", summary=summary)
     except Exception as e:  # noqa: BLE001
         _scan.update(state="error", error=str(e))
@@ -429,8 +566,12 @@ def start_scan(body: ScanReq):
 
 
 @app.get("/api/scan")
-def scan_status():
-    return {**_scan, "log": _scan["log"][-40:]}
+def scan_status(since: int = 0):
+    """F1: scan state + log. The log is the FULL transcript so a long run can be scrolled end-to-end;
+    the console passes `since=<lines already rendered>` and appends only the new tail (`log_total`
+    is the running length — a smaller value than `since` means a newer scan reset the buffer)."""
+    log = _scan["log"]
+    return {**_scan, "log": log[max(0, since):], "log_total": len(log)}
 
 
 # ---------------- impact + ledger loop (C1/C3/C4) ----------------
@@ -476,6 +617,7 @@ class ActionReq(BaseModel):
     refine: bool = True
     refine_attempts: int | None = None
     allow_protected_lb: bool = False
+    allow_overbroad: bool = False   # G2: apply anyway when simulation flagged the policy as too broad
 
 
 _jobs: dict[str, dict] = {}   # job_id -> {state, log, result, error, control, finding_id}
@@ -490,6 +632,19 @@ def _dispatch_action(body: ActionReq, log):
     c, kw = body.control, dict(finding_id=body.finding_id, dry_run=body.dry_run, keep=body.keep,
                                allow_protected=body.allow_protected_lb, out_dir=str(OUT), log=log)
     if c == "service_policy":
+        # G2 gate: a simulated policy found too broad WARNS and requires an explicit override.
+        # Silent when nothing was simulated — G2 adds a check, never a prerequisite.
+        from ..simulate import promotion_block
+        over = promotion_block(str(OUT), body.policy_name) if body.policy_name else None
+        if over and not body.dry_run:
+            if not body.allow_overbroad:
+                raise HTTPException(409, f"simulation says this policy {over.get('reason')}. "
+                                         "Re-run with 'allow overbroad' to apply it anyway.")
+            log(f"⚠ overbroad override: {over.get('reason')}")
+            from ..audit import record as _audit
+            _audit(str(OUT), "simulate_override", finding_id=body.finding_id,
+                   policy=body.policy_name, lb=body.lb, block_rate=over.get("block_rate"),
+                   threshold=over.get("threshold"), reason=over.get("reason"))
         art = str(OUT / "policies" / f"service_policy.{body.policy_name}.json")
         if body.refine and not body.dry_run:
             from ..refiner import refine_apply_service_policy
@@ -528,7 +683,7 @@ def _run_action(job_id: str, body: ActionReq):
     job = _jobs[job_id]
     t0 = time.perf_counter()
     try:
-        res = _dispatch_action(body, lambda m: job["log"].append(m))
+        res = _dispatch_action(body, lambda m: _append(job["log"], m))
         job.update(state="done", result=res)
         if not body.dry_run:  # feed MTTM for the hero + a self-contained record for the model benchmark
             from ..audit import record
@@ -555,11 +710,14 @@ def start_action(body: ActionReq):
 
 
 @app.get("/api/action")
-def action_status(job: str):
+def action_status(job: str, since: int = 0):
+    """F1: same full-transcript + `since` tail contract as /api/scan — the refiner's attach → validate →
+    refine → retry narration is the evidence a band-aid works, so none of it should scroll off."""
     j = _jobs.get(job)
     if not j:
         raise HTTPException(404, "no such job")
-    return {**j, "log": j["log"][-60:], "job": job}
+    log = j["log"]
+    return {**j, "log": log[max(0, since):], "log_total": len(log), "job": job}
 
 
 # ---------------- action endpoints (gated) ----------------
