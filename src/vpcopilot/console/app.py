@@ -235,11 +235,73 @@ def _run_simulation(job_id: str, body: SimReq):
         job.update(state="error", error=str(e))
 
 
+class ReconcileReq(BaseModel):
+    apply: bool = False              # I1: report-only by default — --apply is the human gate
+    finding_id: str | None = None
+    force_probe: bool = False
+    allow_protected_lb: bool = False
+
+
+@app.get("/api/patches")
+def patches():
+    """I1: every live band-aid with age, TTL remaining and cure state.
+
+    A pure ledger read — no XC, no GitHub, no exploit fired — so the Retire step can call it on
+    every render without cost or side effects."""
+    from ..reconcile import list_patches
+    return {"out": str(OUT), "patches": list_patches(str(OUT))}
+
+
+@app.post("/api/reconcile")
+def start_reconcile(body: ReconcileReq):
+    """I1: one reconcile pass in the background, streaming through the same job contract as apply."""
+    import uuid
+    load_dotenv(ENV_PATH, override=True)
+    job_id = uuid.uuid4().hex[:8]
+    _jobs[job_id] = {"state": "running", "log": [], "result": None, "error": None,
+                     "control": "reconcile", "finding_id": body.finding_id}
+    # OUT is captured HERE, not read inside the worker: POST /api/scan reassigns the global with no
+    # lock, so a scan started mid-pass would otherwise repoint a running reconcile at another dir.
+    threading.Thread(target=_run_reconcile, args=(job_id, body, str(OUT)), daemon=True).start()
+    return {"job": job_id, "state": "running"}
+
+
+def _run_reconcile(job_id: str, body: ReconcileReq, out: str):
+    job = _jobs[job_id]
+    log = lambda m: _append(job["log"], m)  # noqa: E731
+    try:
+        from ..reconcile import reconcile as run
+        res = run(out, apply=body.apply, finding_id=body.finding_id,
+                  force_probe=body.force_probe, trigger="console",
+                  allow_protected=body.allow_protected_lb, log=log)
+        job.update(state="done", result=res)
+    except Exception as e:  # noqa: BLE001
+        job.update(state="error", error=str(e))
+
+
 @app.get("/api/runs")
 def runs():
     """Run dirs on disk that have something to export — backs the Retire step's 'all runs' bundle."""
     from ..export import find_runs
     return {"current": str(OUT), "runs": find_runs(".")}
+
+
+@app.get("/api/drift")
+def drift_ep(lb: str, control: str | None = None, policy: str | None = None,
+             finding: str | None = None):
+    """I2: what is on the LB now vs what the last run left vs what is about to be pushed.
+    Read-only — it never PUTs and never writes a snapshot, so it is safe to poll from the UI."""
+    load_dotenv(ENV_PATH, override=True)
+    from ..apply import _load_probe
+    from ..drift import check
+    try:
+        exploit = (_load_probe(str(OUT), finding) or {}).get("exploit") if finding else None
+        art = OUT / "policies" / f"service_policy.{policy}.json" if policy else None
+        spec = json.loads(art.read_text()) if art and art.is_file() else None
+        return check(lb, out_dir=str(OUT), control=control, policy_name=policy,
+                     exploit=exploit, spec=spec, log=lambda m: None)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(400, str(e))
 
 
 @app.get("/api/audit-verify")
@@ -618,6 +680,7 @@ class ActionReq(BaseModel):
     refine_attempts: int | None = None
     allow_protected_lb: bool = False
     allow_overbroad: bool = False   # G2: apply anyway when simulation flagged the policy as too broad
+    force: bool = False             # I2: apply anyway when the pre-apply drift check objects
 
 
 _jobs: dict[str, dict] = {}   # job_id -> {state, log, result, error, control, finding_id}
@@ -650,9 +713,11 @@ def _dispatch_action(body: ActionReq, log):
             from ..refiner import refine_apply_service_policy
             return refine_apply_service_policy(art, body.lb, body.url, finding_id=body.finding_id,
                 name=body.policy_name, keep=body.keep, allow_protected=body.allow_protected_lb,
-                max_refine=body.refine_attempts, config_path=_active_config, out_dir=str(OUT), log=log)
+                max_refine=body.refine_attempts, config_path=_active_config, force=body.force,
+                out_dir=str(OUT), log=log)
         return A.apply_from_scan(art, body.lb, body.url, name=body.policy_name, dry_run=body.dry_run,
-            keep=body.keep, allow_protected=body.allow_protected_lb, out_dir=str(OUT), log=log)
+            keep=body.keep, allow_protected=body.allow_protected_lb, force=body.force,
+            out_dir=str(OUT), log=log)
     if c == "malicious_user":
         return A.apply_malicious_user(body.lb, **kw)
     if c == "rate_limit":
@@ -703,8 +768,12 @@ def start_action(body: ActionReq):
     job_id = uuid.uuid4().hex[:8]
     _jobs[job_id] = {"state": "running", "log": [], "result": None, "error": None,
                      "control": body.control, "finding_id": body.finding_id}
-    for old in list(_jobs)[:-20]:  # keep the last 20 jobs
-        _jobs.pop(old, None)
+    # Keep the last 20 jobs — but never evict one that is still running. Reconcile is the longest
+    # job in the app; trimming it mid-pass would 404 the poll and lose the transcript of a run that
+    # is still mutating the tenant.
+    for old in list(_jobs)[:-20]:
+        if _jobs.get(old, {}).get("state") != "running":
+            _jobs.pop(old, None)
     threading.Thread(target=_run_action, args=(job_id, body), daemon=True).start()
     return {"job": job_id, "state": "running"}
 
@@ -732,6 +801,7 @@ class ApplyReq(BaseModel):
     refine: bool = True
     refine_attempts: int | None = None
     allow_protected_lb: bool = False
+    force: bool = False
 
 
 @app.post("/api/apply")
@@ -743,10 +813,11 @@ def do_apply(body: ApplyReq):
             from ..refiner import refine_apply_service_policy
             return refine_apply_service_policy(art, body.lb, body.url, name=body.name, keep=body.keep,
                                                allow_protected=body.allow_protected_lb,
-                                               max_refine=body.refine_attempts, out_dir=str(OUT), log=lambda m: None)
+                                               max_refine=body.refine_attempts, force=body.force,
+                                               out_dir=str(OUT), log=lambda m: None)
         from ..apply import apply_from_scan
         return apply_from_scan(art, body.lb, body.url, name=body.name, create_only=body.create_only,
-                               dry_run=body.dry_run, keep=body.keep,
+                               dry_run=body.dry_run, keep=body.keep, force=body.force,
                                allow_protected=body.allow_protected_lb, out_dir=str(OUT),
                                log=lambda m: None)
     except Exception as e:  # noqa: BLE001

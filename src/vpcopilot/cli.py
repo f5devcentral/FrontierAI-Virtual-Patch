@@ -157,6 +157,7 @@ def apply(
     probe_login_path: str = typer.Option(None, "--probe-login-path", help="login endpoint path, default /api/login (or VPCOPILOT_PROBE_LOGIN_PATH)"),
     probe_token: str = typer.Option(None, "--probe-token", help="bearer token for validation instead of user/pass (or VPCOPILOT_PROBE_TOKEN)"),
     finding: str = typer.Option(None, "--finding", help="finding id whose probe (out/probes.json) validates this policy; overrides the ledger lookup"),
+    force: bool = typer.Option(False, "--force", help="apply despite the pre-apply drift check: re-attach a policy that is already attached, or push past a conflicting ALLOW on another attached policy"),
     out: str = typer.Option("out", help="output directory"),
 ):
     """Gated apply: (create from scan) -> snapshot -> self-test -> attach -> validate -> refine/rollback."""
@@ -174,10 +175,10 @@ def apply(
         from .refiner import refine_apply_service_policy
         res = refine_apply_service_policy(from_scan, lb, url, name=name, keep=keep,
                                           allow_protected=allow_protected_lb, max_refine=refine_attempts,
-                                          finding_id=finding, out_dir=out, log=logf)
+                                          finding_id=finding, force=force, out_dir=out, log=logf)
     elif from_scan:
         from .apply import apply_from_scan
-        res = apply_from_scan(from_scan, lb, url, name=name, create_only=create_only, **kw)
+        res = apply_from_scan(from_scan, lb, url, name=name, create_only=create_only, force=force, **kw)
     else:
         from .apply import apply_service_policy
         res = apply_service_policy(lb, policy, url, **kw)
@@ -590,6 +591,83 @@ def export(
     rprint(f"wrote [bold]{path}[/bold] · {len(events)} audit event(s)")
 
 
+@app.command(name="patches-list")
+def patches_list_cmd(
+    out: str = typer.Option("out", help="output directory"),
+    expired_only: bool = typer.Option(False, "--expired-only", help="only patches past their TTL"),
+):
+    """Every live band-aid with its age, TTL remaining, and cure state.
+
+    A pure read of the ledger — no XC, no GitHub, no exploit fired."""
+    from .reconcile import list_patches
+
+    rows = list_patches(out)
+    if expired_only:
+        rows = [r for r in rows if r["expired"]]
+    if not rows:
+        rprint("[green]no live band-aids[/green]" if not expired_only else "[green]nothing expired[/green]")
+        raise typer.Exit()
+    t = Table(title="live band-aids")
+    for c in ["finding", "sev", "control", "lb", "age", "TTL left", "cure", "last reconcile"]:
+        t.add_column(c)
+    for r in rows:
+        age = "—" if r["age_hours"] is None else f"{r['age_hours'] / 24:.1f}d"
+        if r["remaining_hours"] is None:
+            left = "[dim]no TTL[/dim]"
+        elif r["expired"]:
+            over = abs(r["remaining_hours"]) / 24
+            left = f"[red]EXPIRED {over:.1f}d[/red]"
+        else:
+            left = f"{r['remaining_hours'] / 24:.1f}d"
+        cure = r["cure_state"] or "none"
+        if r["escalation_count"]:
+            cure += f" [red](escalated ×{r['escalation_count']})[/red]"
+        t.add_row(r["finding_id"], r.get("severity") or "", r["control"] or "", r["lb"] or "",
+                  age, left, cure, r.get("outcome") or "—")
+    rprint(t)
+
+
+@app.command()
+def reconcile(
+    out: str = typer.Option("out", help="output directory"),
+    apply: bool = typer.Option(False, "--apply", help="actually detach a band-aid whose cure is proven; without it the pass reports and changes nothing"),
+    finding: str = typer.Option(None, "--finding", help="reconcile a single finding instead of every live patch"),
+    force_probe: bool = typer.Option(False, "--force-probe", help="ignore the per-finding probe cooldown (only with --finding)"),
+    allow_protected_lb: bool = typer.Option(False, "--allow-protected-lb", help="permit reconciling a protected LB"),
+):
+    """Walk the live band-aids: check each cure PR, re-fire its exploit at ORIGIN, and act.
+
+    Retire when the cure merged and the exploit is gone; hold and report `fix_ineffective` when it
+    merged and the exploit still reproduces; escalate when the TTL passed with no merged cure.
+    Report-only unless `--apply`. Targets come from $VPCOPILOT_RECONCILE_TARGETS, never from the
+    ledger. Exits 2 when anything escalated, so cron or CI goes red."""
+    from .reconcile import reconcile as run
+
+    load_dotenv()
+    if force_probe and not finding:
+        rprint("[red]--force-probe needs --finding[/red] — replaying every destructive exploit at "
+               "once is not something to do by accident.")
+        raise typer.Exit(code=1)
+    logf = lambda m: rprint(f"[dim]{m}[/dim]")  # noqa: E731
+    try:
+        res = run(out, apply=apply, finding_id=finding, force_probe=force_probe, trigger="cli",
+                  allow_protected=allow_protected_lb, log=logf)
+    except RuntimeError as e:
+        rprint(f"[red]{e}[/red]")
+        raise typer.Exit(code=1) from None
+    if res["lock"] == "busy":
+        raise typer.Exit()
+    rprint(Panel.fit(
+        f"[bold]checked[/bold]: {res['checked']}   "
+        f"[bold]retired[/bold]: {res['retired']}   "
+        f"[bold]escalated[/bold]: {res['escalations']}   "
+        f"[bold]fix_ineffective[/bold]: {res['fix_ineffective']}"
+        + ("\n[dim]report-only — pass --apply to detach[/dim]" if not apply else ""),
+        title=f"reconcile {res['pass_id']}"))
+    if res["escalations"] or res["fix_ineffective"]:
+        raise typer.Exit(code=2)
+
+
 @app.command()
 def ledger(out: str = typer.Option("out", help="output directory")):
     """Show the remediation ledger: found -> mitigated -> remediated -> retired."""
@@ -609,6 +687,60 @@ def ledger(out: str = typer.Option("out", help="output directory")):
         t.add_row(e.get("finding_id", ""), e.get("state", ""), e.get("file", ""), bands,
                   (mit["control"] if mit else "—"), (cure["pr_url"] if cure else "—"))
     rprint(t)
+
+
+@app.command()
+def drift(
+    lb: str = typer.Option(..., "--lb", help="load balancer to inspect"),
+    out: str = typer.Option("out", help="run directory holding the snapshots to compare against"),
+    control: str = typer.Option(None, "--control", help="the control you are about to apply"),
+    policy: str = typer.Option(None, "--policy", help="service-policy name you are about to attach"),
+    finding: str = typer.Option(None, "--finding", help="use this finding's exploit for the shadowing check"),
+    artifact: str = typer.Option(None, "--artifact", help="the generated policy artifact you are about to apply; without it the shadowing check has no rules to walk"),
+):
+    """What is on the LB now, versus what the last run left, versus what you are about to push.
+
+    Read-only: no PUT, no snapshot written, nothing in the run dir touched."""
+    import json as _json
+    from pathlib import Path as _Path
+
+    from .apply import _load_probe
+    from .drift import check
+
+    load_dotenv()
+    exploit = (_load_probe(out, finding) or {}).get("exploit") if finding else None
+    art = artifact or (str(_Path(out, "policies", f"service_policy.{policy}.json")) if policy else None)
+    spec = _json.loads(_Path(art).read_text()) if art and _Path(art).is_file() else None
+    r = check(lb, out_dir=out, control=control, policy_name=policy, exploit=exploit, spec=spec,
+              log=lambda m: rprint(f"[dim]{m}[/dim]"))
+    lvs = r["live_vs_snapshot"]
+    t = Table(title=f"drift · {lb}")
+    for c in ["field", "last snapshot", "live now"]:
+        t.add_column(c)
+    for c in lvs["changes"]:
+        t.add_row(c["path"], _json.dumps(c["was"])[:60], _json.dumps(c["now"])[:60])
+    if lvs["changes"]:
+        rprint(t)
+    elif lvs["snapshot"]:
+        rprint(f"[green]no drift[/green] since {lvs['snapshot']}")
+    else:
+        rprint("[dim]no snapshot for this LB yet — nothing to compare against[/dim]")
+    rprint(f"attached controls: {', '.join(r['attached']) or '(none)'}")
+    if r["proposed"]["no_change"]:
+        rprint(f"[yellow]no_change[/yellow] — {r['proposed']['policy_name']} is already attached")
+    elif r["proposed"]["note"]:
+        rprint(f"[dim]{r['proposed']['note']}[/dim]")
+    for d in r["displaces"]:
+        detail = "contents unreadable" if d.get("unreadable") else f"{d['rules']} rule(s), {d['denies']} DENY"
+        rprint(f"[yellow]⚠ applying will DETACH[/yellow] '{d['policy']}' ({detail})"
+               + ("  [red]— and it is what currently blocks this exploit[/red]"
+                  if d["protects_exploit"] else ""))
+    for c in r["conflicts"]:
+        rprint(f"[red]CONFLICT[/red] {c['reason']}")
+    for w in r["warnings"]:
+        rprint(f"[yellow]⚠ {w}[/yellow]")
+    if not r["ok_to_apply"]:
+        raise typer.Exit(code=1)
 
 
 @app.command(name="xc-status")

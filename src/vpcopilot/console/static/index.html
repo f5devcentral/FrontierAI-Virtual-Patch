@@ -200,6 +200,7 @@
   <section id="mitigate">
     <div class="card"><h2>④ Mitigate live with XC</h2>
       <p class="sub">Apply each recommended band-aid to the load balancer and validate it against the finding's real exploit — attach → validate → refine → keep or roll back. Turn off dry-run in Run settings to make it live. <b>“✓ covered by …”</b> means a sibling finding's band-aid already protects this one (same file + control). Only per-request controls (service_policy, api_schema) block a single fired exploit; rate-limit / bot / malicious-user / data-guard are behavioral and validate at config level.</p>
+      <div id="driftBox"></div>
       <div id="mitigateBox">Loading…</div>
     </div>
   </section>
@@ -216,7 +217,14 @@
   <!-- ⑥ RETIRE -->
   <section id="retire">
     <div class="card"><h2>⑥ Retire band-aids</h2>
-      <p class="sub">Once a cure ships, detach its temporary XC control. The ledger tracks every finding found → mitigated → remediated → retired.</p>
+      <p class="sub">Once a cure ships, detach its temporary XC control. The ledger tracks every finding found → mitigated → remediated → retired. Every band-aid also carries a <b>TTL</b> from the moment it was applied — <b>reconcile</b> walks the live ones, checks each cure PR, re-fires the exploit at the app's <b>origin</b> (around the band-aid, so a blocked request can't be mistaken for a fixed bug) and reports what it would do. It never detaches unless you tell it to.</p>
+      <div class="rowa">
+        <button class="go ghost" style="margin-top:0" onclick="runReconcile(false)">Reconcile (report only) ▶</button>
+        <button class="mini" onclick="runReconcile(true)">Reconcile &amp; retire proven fixes</button>
+        <span class="muted" id="reconcileNote"></span>
+      </div>
+      <div id="reconcileJob" class="jobbox" style="display:none"></div>
+      <div id="patchBox"></div>
       <div id="ledgerBox">Loading…</div>
     </div>
     <div class="card"><h2>Audit trail <span class="muted">— every change made to a load balancer</span></h2>
@@ -427,9 +435,32 @@ function renderMitigate(){
       <span class="muted">applies every band-aid one at a time under Run settings — dry-run rehearses, off goes live; continues past failures.</span>
       <span id="mitAllProg" style="font-weight:600"></span></div>` : "";
   mitigateBox.innerHTML = rows ? bar + `<table><thead><tr><th>finding</th><th>sev</th><th>mitigate</th></tr></thead><tbody>${rows}</tbody></table>` : '<div class="empty">No verified findings — run a scan.</div>';
+  loadDrift();
+}
+// I2: the state of the target LB *before* you click anything. Read-only — /api/drift never PUTs and
+// never writes a snapshot, so it is safe to call every time this section renders.
+async function loadDrift(){
+  const box=document.getElementById("driftBox"), st=S();
+  if(!box) return;
+  if(!st.lb){ box.innerHTML=""; return; }
+  // Silent when the check cannot run — no XC creds loaded, LB not in this namespace. This strip is
+  // a convenience readout; the gate that actually matters runs inside the apply, where a failure
+  // is a failure. A red banner on a page you are merely looking at would be noise.
+  let d; try{ d=await jget("/api/drift?lb="+encodeURIComponent(st.lb)); }
+  catch(e){ box.innerHTML=""; return; }
+  const lvs=d.live_vs_snapshot||{}, ch=lvs.changes||[];
+  const bits=[`<b>${esc(d.lb)}</b> currently has: ${(d.attached||[]).map(esc).join(", ")||"no controls attached"}`];
+  if(ch.length){
+    bits.push(`<span class="nob">⚠ ${ch.length} field(s) changed on this LB since the last apply — `
+      + `someone edited it outside this tool</span>`);
+    bits.push(`<pre class="joblog" style="max-height:140px">`
+      + ch.map(c=>`${esc(c.path)}: ${esc(JSON.stringify(c.was))} → ${esc(JSON.stringify(c.now))}`).join("\n")
+      + `</pre>`);
+  } else if(lvs.snapshot){ bits.push('<span class="muted">· no drift since the last snapshot</span>'); }
+  box.innerHTML=`<div class="kv" style="margin-bottom:10px">${bits.join(" ")}</div>`;
 }
 // one apply → resolves ONLY when the job finishes, so a batch never fires two live applies at once
-function applyOne(fid, control, policyName){
+function applyOne(fid, control, policyName, force){
   return new Promise(resolve=>{
     const st=S(); const box=document.getElementById("job-"+fid);
     if(!box){ resolve({ok:false}); return; }
@@ -446,7 +477,7 @@ function applyOne(fid, control, policyName){
     }
     jpost("/api/action",{control,finding_id:fid,policy_name:policyName,lb:st.lb,url:st.url,
         dry_run:st.dry,keep:st.keep,refine:st.refine,refine_attempts:st.refineAttempts,allow_protected_lb:st.allow,
-        allow_overbroad: !!(sim && sim.blocked_promotion)})
+        allow_overbroad: !!(sim && sim.blocked_promotion), force: !!force})
     .then(job=>{
       let n=0;  // lines already appended for this job — same full-transcript + ?since= tail as the scan log
       const poll=setInterval(async()=>{
@@ -454,7 +485,13 @@ function applyOne(fid, control, policyName){
         pushLog(logEl, s.log); n = s.log_total ?? (n + (s.log||[]).length);
         if(s.state==="running"){ statEl.textContent=`applying ${esc(control)}…`; return; }
         clearInterval(poll);
-        if(s.state==="error"){ box.className="jobbox err"; statEl.textContent="error: "+s.error; loadHero(); resolve({ok:false}); return; }
+        if(s.state==="error"){
+          box.className="jobbox err"; statEl.textContent="error: "+s.error;
+          // I2: the drift guard refuses rather than vetoes — offer the documented override inline.
+          if(/force=True/.test(s.error||"") && !force)
+            statEl.innerHTML+=` <button class="go" style="margin:0 0 0 8px;padding:2px 10px"
+              onclick="applyOne('${esc(fid)}','${esc(control)}',${policyName?`'${esc(policyName)}'`:"null"},true)">apply anyway ▶</button>`;
+          loadHero(); resolve({ok:false}); return; }
         renderApplyResult(box,statEl,control,s.result||{}); loadHero();
         const r=s.result||{};
         resolve({ok: r.passed!==false && r.config_enabled!==false, result:r});  // mirror renderApplyResult's success test
@@ -496,8 +533,14 @@ function baLine(v){ return v? `exploit ${v.exploit_status!=null?v.exploit_status
 function renderApplyResult(box,statEl,control,res){
   const ok = res.passed!==false && res.config_enabled!==false;
   box.className="jobbox "+(ok?"ok":"err");
+  if(res.mode==="no_change"){   // I2: nothing was pushed, so pass/fail has nothing to report on
+    box.className="jobbox";
+    statEl.innerHTML=`<b>no change</b> <span class="muted">— ${esc(res.policy||control)} is already the `
+      + `attached service policy; nothing was pushed. Use “apply anyway” to re-validate it.</span>`;
+    return;
+  }
   const bits=[`<b>${esc(res.mode||control)}</b>`];
-  if(res.passed!==undefined) bits.push(`passed=${res.passed}`);
+  if(res.passed!==undefined && res.passed!==null) bits.push(`passed=${res.passed}`);
   if(res.config_enabled!==undefined) bits.push(`enabled=${res.config_enabled}`);
   if(res.attempts>1) bits.push(`<span class="badge">self-healed in ${res.attempts} attempts</span>`);
   else if(res.attempts) bits.push(`${res.attempts} attempt`);
@@ -625,6 +668,67 @@ async function loadLedger(){
       <td>${mit}</td><td>${cure}</td><td>${retire}</td></tr>`;
   }).join("");
   ledgerBox.innerHTML = rows ? `<table><thead><tr><th>finding</th><th>sev</th><th>progress</th><th>mitigation</th><th>cure</th><th></th></tr></thead><tbody>${rows}</tbody></table>` : '<div class="empty">empty — run a scan.</div>';
+  loadPatches();
+}
+
+// ---- I1: patch expiry ----
+// A pure ledger read (/api/patches fires nothing and calls nothing), so this renders on every
+// Retire render without cost. An entry written before TTLs existed has no expiry — it shows
+// "no TTL" and is treated as never expiring, not as overdue.
+function ttlCell(p){
+  if(p.remaining_hours==null) return '<span class="muted">no TTL</span>';
+  if(p.expired) return `<span class="nob">EXPIRED ${(Math.abs(p.remaining_hours)/24).toFixed(1)}d ago</span>`;
+  const d=p.remaining_hours/24;
+  return `${d.toFixed(1)}d left` + (d<2?' <span class="nob">· due soon</span>':"");
+}
+async function loadPatches(){
+  const box=document.getElementById("patchBox");
+  if(!box) return;
+  let d; try{ d=await jget("/api/patches"); }catch(e){ box.innerHTML=""; return; }
+  const ps=(d.patches||[]);
+  if(!ps.length){ box.innerHTML=""; document.getElementById("reconcileNote").textContent="no live band-aids to reconcile."; return; }
+  const overdue=ps.filter(p=>p.expired).length, escalated=ps.filter(p=>p.escalation_count).length;
+  document.getElementById("reconcileNote").innerHTML =
+    `${ps.length} live band-aid(s)` + (overdue?` · <span class="nob">${overdue} past TTL</span>`:"")
+    + (escalated?` · <span class="nob">${escalated} escalated</span>`:"");
+  const rows=ps.map(p=>{
+    const age = p.age_hours==null ? "—" : (p.age_hours/24).toFixed(1)+"d";
+    const out = p.outcome ? `<span class="mono" style="font-size:11px">${esc(p.outcome)}</span>` +
+      (p.reason?`<div class="muted" style="font-size:11px">${esc(p.reason)}</div>`:"") : '<span class="muted">not yet reconciled</span>';
+    return `<tr><td><span class="mono" style="font-size:11px">${esc(p.finding_id)}</span></td>
+      <td>${esc(p.control||"")} @ ${esc(p.lb||"")}</td><td>${age}</td><td>${ttlCell(p)}</td>
+      <td>${esc(p.cure_state||"none")}</td><td>${out}</td></tr>`;
+  }).join("");
+  box.innerHTML=`<div class="kv" style="margin:10px 0 6px"><b>Patch expiry</b></div>
+    <table><thead><tr><th>finding</th><th>band-aid</th><th>age</th><th>TTL</th><th>cure</th><th>last reconcile</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+async function runReconcile(apply){
+  const box=document.getElementById("reconcileJob");
+  if(apply && !confirm("Reconcile and RETIRE any band-aid whose cure is proven merged and whose exploit no longer reproduces at origin?\n\nThis detaches live XC controls.")) return;
+  box.style.display="block"; box.className="jobbox";
+  box.innerHTML='<div class="jobstat">starting reconcile…</div><pre class="joblog"></pre>';
+  const logEl=box.querySelector(".joblog"), statEl=box.querySelector(".jobstat");
+  let job; try{ job=await jpost("/api/reconcile",{apply:!!apply}); }
+  catch(e){ box.className="jobbox err"; statEl.textContent="error: "+e.message; return; }
+  let n=0;
+  const poll=setInterval(async()=>{
+    let s; try{ s=await jget("/api/action?job="+job.job+"&since="+n); }catch(e){ return; }
+    pushLog(logEl, s.log); n = s.log_total ?? (n + (s.log||[]).length);
+    if(s.state==="running"){ statEl.textContent="reconciling…"; return; }
+    clearInterval(poll);
+    if(s.state==="error"){ box.className="jobbox err"; statEl.textContent="error: "+s.error; return; }
+    const r=s.result||{};
+    if(r.lock==="busy"){ box.className="jobbox"; statEl.textContent="another reconcile pass is already running."; return; }
+    const bad = (r.escalations||0)+(r.fix_ineffective||0);
+    box.className="jobbox "+(bad?"err":"ok");
+    statEl.innerHTML=`<b>${r.checked||0}</b> live patch(es) checked · <b>${r.retired||0}</b> retired · `
+      + `<b>${r.escalations||0}</b> escalated · <b>${r.fix_ineffective||0}</b> fix_ineffective`
+      + (apply?"":' <span class="muted">— report only; nothing was detached</span>');
+    // A pass writes audit records and (with --apply) changes what is live, so refresh everything
+    // this page shows — leaving the audit trail and the hero counters stale after a retire is how
+    // an operator concludes nothing happened.
+    loadLedger(); loadAudit(); loadHero();
+  },1200);
 }
 // ---- audit trail + evidence export (F3) ----
 // The trail is SHOWN before it can be exported: an operator should be able to check what leaves the

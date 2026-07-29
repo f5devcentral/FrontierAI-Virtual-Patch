@@ -62,6 +62,34 @@ agent to correct the spec (using the exact exploit + legit requests), and retrie
 required". The working refined spec is written back to the artifact. `--no-refine` for single-shot.
 Configurable in the console's action bar (**refine** + **attempts**).
 
+### Pre-apply drift check (I2)
+
+Before anything is created or attached, a **read-only** comparison runs against the live LB. It
+answers three questions and short-circuits or warns accordingly:
+
+```sh
+vpcopilot drift --lb <lb>                                          # what changed since the last apply
+vpcopilot drift --lb <lb> --control service_policy --policy <name> --finding <id>
+```
+
+| finding | what happens | override |
+|---|---|---|
+| the policy is **already the attached one** | reports `no_change` and **writes nothing** — no LB PUT, no snapshot, no run artifact | `--force` |
+| a field on the LB **changed since the last snapshot** (someone edited it in the XC console) | field-level diff printed and audited as `drift_detected`; the apply continues | — |
+| applying will **detach** another service policy | warned and audited as `policy_displaced`, including whether the displaced policy is what currently blocks this exploit; the apply continues | — |
+| an **ALLOW inside the policy being applied** matches the exploit before its DENY | refused — under FIRST_MATCH the band-aid would attach cleanly and block nothing | `--force`, or `--refine` (default), which reorders it instead |
+
+`drift` exits `1` when it finds a conflict, so it composes in a script. The check never PUTs, never
+writes a snapshot, and never touches the run directory — it is safe to run or poll at any time.
+
+**Why displacement is a warning and not a refusal.** Attaching replaces `active_service_policies`
+wholesale, so every apply detaches whatever was there. Replacing the previous band-aid is the
+normal flow; refusing would break every second apply. It is said out loud and written down instead.
+
+In the console the same check runs inside the Mitigate job, so its warnings appear in the live log.
+A refusal renders an **apply anyway** button, and `no_change` renders as its own outcome rather
+than a pass or a fail.
+
 ## 5. Open the code-fix PR (the cure)
 ```sh
 vpcopilot pr --repo owner/name --base <branch> --path-prefix <repo-relative-dir> [--finding <id>] [--dry-run]
@@ -80,7 +108,78 @@ vpcopilot export --all [--root DIR]            # every run dir on disk, each in 
 vpcopilot report --open   # standalone shareable HTML dashboard of the results
 vpcopilot retire --finding <id>   # C2: when the cure PR merges, detach the band-aid + mark retired
 vpcopilot retire --all            # retire every mitigated finding whose cure PR merged (--force to skip the check)
+vpcopilot patches-list            # I1: every live band-aid with age, TTL remaining and cure state
+vpcopilot reconcile               # I1: check every live band-aid and report; add --apply to act
 ```
+
+### Patch expiry and reconcile (I1)
+
+Every applied control gets a **TTL** the moment it is applied — seven days by default,
+`$VPCOPILOT_DEFAULT_TTL_HOURS` to change it. `reconcile` walks the live band-aids and decides:
+
+| the cure PR | the exploit, fired at **origin** | what happens |
+|---|---|---|
+| merged | no longer reproduces | **retire** — the fix is real, detach the band-aid |
+| merged | still reproduces | **`fix_ineffective`** — hold the band-aid, report loudly |
+| not merged, past TTL | not fired | **escalate** — hold the band-aid, notify |
+
+```sh
+export VPCOPILOT_RECONCILE_TARGETS="crapi-lab=http://10.0.0.5:8888 vampi-lab=http://10.0.0.5:5000"
+vpcopilot reconcile --out /abs/path/out           # report only — changes nothing
+vpcopilot reconcile --out /abs/path/out --apply   # detach band-aids whose cure is proven
+vpcopilot reconcile --finding <id> --force-probe  # debug one finding, ignoring the cooldown
+vpcopilot patches-list --expired-only
+```
+
+**Why the probe fires at the origin, not the load balancer.** With the band-aid live, firing at the
+LB proves nothing — a blocked exploit means the band-aid works, which you already knew. The only
+way to ask *"is the bug actually gone?"* while leaving the patch in place is to go around the
+patch, so reconcile fires at an operator-declared origin URL. Reconcile never detaches a control to
+test it: that would turn an unattended evidence-gathering pass into a mutating one, and six of the
+seven controls are LB-wide, so detaching for one finding drops protection for every other finding
+on that LB.
+
+**Targets are an explicit allowlist, never inferred.** `VPCOPILOT_RECONCILE_TARGETS` is
+`lb=origin_url` pairs. An LB not listed is skipped; a protected LB is refused even if listed; with
+the variable unset `reconcile` exits non-zero rather than guessing. A **bare `lb`** with no origin
+means *"watch this, but never probe it"* — the right setting for an origin that refuses direct
+access (one real lab origin sits behind a BIG-IP that answers `403 Direct origin access denied`).
+
+**It refuses to guess.** No origin, an unreachable origin, a failing legit request, a probe that
+cannot authenticate, a finding with no recorded probe, an unreadable cure PR — every one of these
+holds the band-aid and says why. The dangerous failure mode is the opposite: a connection error
+reading as "the exploit did not succeed", reading as "fixed", detaching a control that was
+protecting a still-vulnerable app.
+
+**Report-only unless `--apply`.** Authoring the crontab is the human gate, exercised once. Exits
+`2` when anything escalated or a fix proved ineffective, so cron or CI goes red:
+
+```
+0 3 * * *  cd /srv/vpcopilot && VPCOPILOT_RECONCILE_TARGETS="crapi-lab=http://10.0.0.5:8888" \
+           VPCOPILOT_RECONCILE_TRIGGER=cron \
+           .venv/bin/vpcopilot reconcile --out /srv/vpcopilot/out --apply
+```
+
+`VPCOPILOT_RECONCILE_TRIGGER=cron` is what makes a scheduled pass distinguishable in the audit
+trail — cron invokes the CLI, so without it every nightly record is stamped `cli`.
+
+Use an **absolute** `--out`: cron has no working directory, and reconcile refuses to run rather
+than minting an empty run dir and reporting zero patches forever. A second pass exits cleanly while
+the first holds the lock — cron jobs that wait pile up.
+
+**The destructive-replay cooldown.** These exploits genuinely move money and escalate roles, and
+they feed the same Malicious-User telemetry the tenant reports on, so a finding's probe fires at
+most once per `$VPCOPILOT_RECONCILE_MIN_INTERVAL_HOURS` (default 24). Only the probe is throttled —
+the TTL and PR checks are free reads and run every pass, so an escalation is never delayed.
+
+**Escalation delivery.** An audit record always, plus a POST to `$VPCOPILOT_ESCALATION_WEBHOOK`
+when one is set (silent when not; a dead webhook never changes an outcome). Escalation fires once
+and then only when something changes or after `$VPCOPILOT_RECONCILE_RENOTIFY_HOURS` (default 168) —
+otherwise a nightly cron appends another escalation forever.
+
+In the console this is the ⑥ Retire step: a patch-expiry table with age and TTL per band-aid, and
+**Reconcile (report only)** / **Reconcile & retire proven fixes** buttons streaming the same live
+log as an apply.
 **Refine with a blast-radius gate.** Set `VPCOPILOT_SIM_LOGS` to a traffic sample and the
 refiner stops at the first policy that blocks the exploit *and* stays under the threshold, instead
 of the first that merely blocks it — a refinement that widened the rule too far is fed back as
@@ -206,13 +305,21 @@ VPCOPILOT_DEFAULT_PREFIX=                 # usually empty
 - **Guardrails:** `PROTECTED_POLICIES` (the `nimbus-*` demo policies) can't be created/deleted;
   protected LBs (`VPCOPILOT_PROTECTED_LBS`, default `nimbus-www`) can't be mutated without
   `--allow-protected-lb`.
+- **Pre-apply drift check:** before any create or attach, the live LB is compared against the last
+  snapshot and against what is about to be pushed — see [Pre-apply drift check](#pre-apply-drift-check-i2).
+  Re-applying an unchanged policy writes nothing; a policy that could never fire is refused.
 - **Reversible:** every apply snapshots the LB and rolls back on validation failure (or by
   default). Every change is written to the append-only audit log — the finding that justified it,
   the control and the XC object, the load balancer and its namespace, whether it was kept or rolled
   back, and who ran it (`VPCOPILOT_ACTOR`, else the OS user) on which host, under which run id.
   Dry runs are not recorded: nothing changed, so there is nothing to answer for.
-- **Band-aids are temporary:** every finding also gets a code-fix PR; the ledger tracks each
-  finding to `retired` (band-aid removed once the cure merges).
+- **Band-aids are temporary — and now provably so:** every finding also gets a code-fix PR; the
+  ledger tracks each finding to `retired` (band-aid removed once the cure merges). Every applied
+  control also carries a TTL, and `reconcile` escalates one that outlives it. See
+  [Patch expiry and reconcile](#patch-expiry-and-reconcile-i1).
+- **Reconcile never removes protection it cannot justify:** it detaches only with `--apply`, and
+  only after firing the finding's real exploit at the app's origin — around the band-aid — and
+  watching it fail. Every branch that cannot establish that fact holds the control instead.
 
 ## Worked example (Nimbus)
 ```sh

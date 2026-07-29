@@ -350,61 +350,124 @@ ship. That is the case virtual patching exists for, and the pipeline cannot see 
 Nothing notices a band-aid nobody retired. The claim that virtual patches are temporary
 holds only while a human keeps checking.
 
-- [ ] **I1** Patch expiry and reconcile loop. (L, P1)
-  Give every applied control a TTL at apply time. `vpcopilot reconcile` walks the ledger,
-  checks each cure PR, re-runs the finding's probe against origin, and acts: retire when the
-  cure merged and the exploit no longer reproduces, hold and report `fix_ineffective` when
-  the cure merged and it still does, escalate when the TTL passed with no merged cure.
-  - Acceptance: `vpcopilot patches list` shows every live band-aid with age, TTL remaining,
-    and PR state (`vpcopilot patches-list`); reconcile is idempotent and safe to run from cron or
-    CI; an escalation
-    leaves the control in place and writes an audit record; the console's ⑥ Retire step
+- [x] **I1** Patch expiry and reconcile loop. (L, P1) — **DONE:** `reconcile.py`. Every applied
+  control gets a TTL at `ledger.mark_mitigated`, the one chokepoint all eight apply paths already
+  call, so no apply site changed. `vpcopilot reconcile` walks the live band-aids and takes one of
+  three branches per finding; `vpcopilot patches-list` is the cheap read. Console: `POST
+  /api/reconcile` (background job, same log contract as apply) + `GET /api/patches`, surfaced as a
+  patch-expiry table and two buttons in step ⑥ Retire. Three new audit actions, category
+  `reconcile`. Verified live against the tenant and against real GitHub.
+  - **The probe fires at ORIGIN, and that question decided the item.** With the band-aid live,
+    firing at the LB proves only that the band-aid works. Measuring the tenant settled which of the
+    three candidate designs was real: `crapi-lab` and `vampi-lab` origins answer directly (200),
+    while `vpcopilot-lab`'s sits behind a BIG-IP that returns `403 Direct origin access denied`.
+    So an operator-declared origin URL works — and "cannot probe" is a routine state, not an edge
+    case. Detach → fire → re-attach was rejected: it turns an unattended pass into a mutating one,
+    six of seven controls are LB-wide so detaching for one finding drops protection for all the
+    others on that LB, and `ApplyContext.load()` writes a snapshot per call, so a nightly pass
+    would repoint `drift.latest_snapshot` and I2 would start reporting reconcile as operator drift.
+  - **Acceptance, as met:** `patches-list` shows age, TTL remaining and PR state; reconcile is
+    idempotent and cron-safe (`O_EXCL` pass lock that exits rather than piling up and breaks itself
+    when stale; a pass that changes nothing writes nothing; escalate-once-then-on-change); an
+    escalation leaves the control in place (`kept: true`) and writes an audit record; step ⑥
     surfaces TTL and escalation state.
-  - Surfaces: extend `ledger.py` and `retire.py`, `vpcopilot reconcile` + `POST /api/reconcile`,
-    `vpcopilot patches-list` + `GET /api/patches`.
-  - **Reconciled:** there is no Ledger tab — the ledger renders inside the ⑥ Retire step
-    (`#ledgerBox`). Effort raised to **L**: TTL persistence, a three-outcome state machine,
-    re-running probes against origin, two commands, two console surfaces, and cron idempotence.
-    `patches list` as two words is not addable — there is no typer sub-app (`cli.py:15`, every
-    command is a flat `@app.command()`), so it follows the kebab convention like `bench-model`.
-    Both commands need a console twin per the two-surfaces invariant, or an explicit exemption.
-  - **Targets (decided 2026-07-27): lab and staging only** — `vpcopilot-lab`, `crapi-lab`,
-    `vampi-lab` and their like. Reconcile fires **real exploits unattended**, so the target list is
-    an explicit allowlist (`VPCOPILOT_RECONCILE_TARGETS`), never inferred from the ledger, and a
-    protected LB is refused outright. Production reconcile is out of scope for this item.
-  - **What that decision resolves, and what it does not.** Disposable environments make the two
-    sharpest objections moot: a destructive exploit (the negative-amount transfer literally moves
-    money; a mass-assignment escalates a role) is acceptable against lab data, and detaching the
-    band-aid to test then re-attaching is an acceptable exposure window there. Two things survive:
-    (a) **there is no notion of "origin" in the codebase** — `probe.py` fires at a `target_url` and
-    nothing tracks the app's address behind the LB, so I1 must either configure an origin per
-    finding or use detach → fire → re-attach (in a `finally`, like the spine); (b) repeated runs
-    still accumulate state and pollute the malicious-user telemetry the demo points at, so a
-    minimum interval between replays of the same finding belongs in the design.
+  - **Decisions (2026-07-29):** escalation delivers an audit record + exit 2 **and** an optional
+    `VPCOPILOT_ESCALATION_WEBHOOK`; reconcile is **report-only unless `--apply`** — authoring the
+    crontab is the human gate, exercised once; `init_from_scan` no longer prunes an entry whose
+    band-aid is still live.
+  - **Deliberate behaviour change:** `ledger.init_from_scan` used to delete every entry absent from
+    the current triage, including one whose control was still attached — orphaning a live band-aid
+    where reconcile could never find it. It now keeps entries with a live mitigation. Cross-target
+    mixing (the P0-3 invariant) is still prevented, because a finding from another app has no
+    mitigation of ours.
+  - **Refusing to guess is a first-class outcome.** No origin, unreachable origin, failing legit
+    request, probe that cannot authenticate, no recorded probe, unreadable cure PR — each holds the
+    band-aid and says why. The dangerous failure is the mirror image: a connection error reading as
+    "the exploit did not succeed", reading as "fixed", detaching a control protecting a still-
+    vulnerable app.
+  - **No new state.** `STATES` stays four long and `_advance` is untouched: `fix_ineffective` and
+    `escalated` are facts about time and evidence, not lifecycle positions — a finding past its TTL
+    is still `mitigated`. Four other modules order these states by index. TTL and reconcile state
+    are top-level keys, deliberately not nested in `mitigation`, which `report.py` stringifies
+    straight into the committed demo fixture.
+  - **Found by adversarial review, before shipping** (33 findings raised, 18 refuted, 15 confirmed
+    and fixed; the first two were reproduced live against the tenant):
+    - **A band-aid could vouch for its own removal.** Both HTTP paths follow redirects and nothing
+      checked which host answered, so a probe that reached the LB — via a canonical-host redirect
+      or a mistyped origin — was blocked by the very control under test, and that read as "the app
+      is fixed". Now `probe.blocked_by_edge()` separates an F5 edge verdict from the app's own, and
+      that case is `skipped_not_at_origin`. **Verified live**: a real DENY policy attached to
+      `crapi-lab`, reconcile pointed at the public URL, probe returned `blocked=True, legit_ok=True`
+      — the exact retire conditions — and the guard held it. Tenant restored afterwards.
+    - **Retiring one finding could strip another's protection.** Six of seven controls are LB-wide,
+      so detaching finding A's WAF removes finding B's too — and Data Guard dies with the WAF it
+      hangs off, a pair that ships in the demo dataset. `_control_present` cannot see this: it
+      answers "is a control of this kind attached", not "is this mine and does anyone else need
+      it". Now `skipped_shared_control`, plus `skipped_not_our_policy` when the attached policy
+      name is not the one this finding applied.
+    - A transient `ok` (probe cooling down) overwrote a standing `fix_ineffective`, turning a
+      known-broken fix green on the dashboard and in cron.
+    - `last_probe_at` was stamped for probes that never fired — a missing probes.json or a wrong
+      login path silenced the real probe for 24h. Observed live.
+    - One finding's exception ended the whole pass, so findings after it were never checked.
+    - `--force-probe`'s guard lived only in the CLI, leaving the console able to mass-replay every
+      destructive exploit; it now lives in the module, where both surfaces get it.
+    - Reconcile's probe was stored as `before_after`, which `report.py`'s Band-aid impact table
+      renders and marks `fail` without a `passed` key — a successful auto-retire showed as a
+      failure. It is `origin_probe` now.
+    - Plus: a vacuous origin gate for probes with no `legit` leg, `init_from_scan` writing the
+      ledger outside `_LOCK`, denormalized finding fields not reaching the export columns they were
+      added for, `trigger=cron` documented but unreachable, and the console refreshing only the
+      ledger after a pass.
+  - **Fixed en route (I2 defect):** `drift._control_present` reported EVERY control as attached on
+    an LB whose spec omitted the key, because each `detach_control` also *writes* an explicit
+    disable marker, so "detaching changed the spec" was true even when the control was never there.
+    Now derived from what detach **removed**. Pinned by a 17-case table over all seven controls.
 
-- [ ] **I2** Drift and conflict detection. (M, P1)
-  `snapshots/` already captures the pre-change LB state. Turn that into a comparison run
-  before apply: what is on the LB now versus what the last run left versus what is about to
-  be pushed.
-  - Acceptance: re-applying an unchanged control reports `no_change` and writes nothing; a
-    hand edit made in the XC console since the last apply reports as a field-level diff; an
-    earlier ALLOW rule shadowing the new DENY blocks apply as a conflict; drift runs
-    read-only.
-  - Surfaces: `src/vpcopilot/drift.py`, `vpcopilot drift --lb <name>`, `GET /api/drift`,
-    a drift check before `engine.ApplyContext.load()` takes the snapshot.
-  - **Reconciled:** `engine.SafeApply` is not a symbol — "SafeApply spine" is prose for
-    `engine.py`, which exports `RollbackError`, `protected_lbs`, `guard_lb`, `ApplyContext`,
-    `poll_until`, `safe_rollback`. The snapshot is taken in `ApplyContext.load()`.
-  - **`no_change` must return before `ApplyContext.load()`**, not merely before the mutation:
-    `load()` writes `out/lb_snapshot.json` *and* a fresh `out/snapshots/<lb>-<ts>.json` on every
-    call (`engine.py:63-72`), and `self_test()` always issues an idempotent PUT to XC
-    (`engine.py:75-83`). A drift check therefore does its own `xc.get_lb()`.
-  - **Partly built:** `ApplyContext.load()` already writes per-LB timestamped snapshots to
-    `out/snapshots/` and `export.py` already bundles them, so the raw material exists. Note also
-    that `lint_service_policy` already implements an *exploit-relative* FIRST_MATCH shadow check
-    (`apply.py:116-152`) — it returns early without an exploit request (`apply.py:130-131`), so
-    the reusable piece for a drift comparison is the `_matches` + FIRST_MATCH walk, not the
-    function as-is.
+- [x] **I2** Drift and conflict detection. (M, P1) — **DONE:** `drift.py` compares live LB vs last
+  snapshot vs proposed, read-only throughout. `drift.preflight()` is the pre-apply gate, called by
+  **both** apply paths — `apply.apply_from_scan` and `refiner.refine_apply_service_policy` (the
+  latter is the default for `--from-scan` and the console's Mitigate button, so gating only the
+  former would have gated nothing anyone uses). Surfaces: `vpcopilot drift --lb <name>` (exit 1 on
+  conflict), `GET /api/drift`, `--force` / console **apply anyway**. Six new audit actions, all
+  category `gate`. Verified live against `banknimbus-dev`.
+  - **Acceptance, as met:**
+    - `no_change` — met. Reports and writes nothing: no LB PUT, no `snapshots/`, no
+      `lb_snapshot.json`, and no stray policy object, because the gate runs before the XC *create*,
+      not just before `ApplyContext.load()`.
+    - field-level diff of a hand edit — met. Verified against a real 2026-07-24 snapshot of
+      `banknimbus-dev`: 12 dotted-path changes, correctly attributed.
+    - drift runs read-only — met, and pinned by tests on both the CLI and the endpoint (the
+      endpoint is polled from the browser; a version that wrote a snapshot would corrupt the run
+      dir just by someone opening a page).
+    - **"an earlier ALLOW rule shadowing the new DENY blocks apply as a conflict" — the criterion
+      as written was wrong, and running it live is what proved it.** It assumes the new policy is
+      appended after the attached ones. Both attach paths do the opposite — they replace the oneof
+      with exactly one policy (`apply.py`, `refiner.py`: `active_service_policies = {"policies":
+      [{ns, name}]}`) — so this tool never leaves two service policies attached and there is no
+      earlier policy to be shadowed by. The first live run produced a confident false positive on
+      `banknimbus-dev`. Replaced by the two real behaviours underneath it:
+      - **shadowing, in its only true scope** — an ALLOW *inside the policy being applied* that
+        matches the exploit before its DENY. This **refuses** (`--force` overrides), and reuses
+        `lint_service_policy` rather than re-deriving FIRST_MATCH so the two can never disagree.
+        On the refine path it degrades to a warning: reordering rules is what the refine loop
+        exists to do, and refusing there would break the default flow to protect it from a problem
+        it already fixes.
+      - **displacement** — that same wholesale replacement silently *detaches* whatever was
+        attached, which is a live loss of protection nothing was reporting. Warned and audited
+        (`policy_displaced`, carrying whether the displaced policy is what currently blocks this
+        exploit), never refused: replacing the previous band-aid is the normal flow and refusing
+        would break every second apply. Follows the G2 precedent — warn with an audited override,
+        not a machine veto.
+  - **Deliberate partial:** `no_change` is determined for `service_policy` only. There the proposed
+    end state is exact (that policy name in `active_service_policies`), so "unchanged" is a fact.
+    For the six LB-wide toggles, presence is detectable by inverting `detach_control` but presence
+    is **not** parameter equality — a `rate_limit` already on at 100/MINUTE would read as unchanged
+    while you push 5/MINUTE. Silently skipping a real change is worse than re-applying an identical
+    one, so those report `already_attached` with a note and are never auto-skipped.
+  - **No regressions:** an LB already carrying a foreign policy still mitigates (warn + proceed);
+    dry runs are never gated; `create_only` is never gated; behaviour with no snapshot and no
+    conflict is byte-identical to before. Each pinned by a test.
 
 ---
 
