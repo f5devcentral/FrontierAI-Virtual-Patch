@@ -12,6 +12,18 @@ def _client():
     return TestClient(A.app)
 
 
+def _artifact(out, name="deny-wide"):
+    """K1 moved the G2 gate out of `_dispatch_action` and into `simulate.promotion_gate`, called by
+    both apply paths so the CLI and the MCP server get it too. It therefore fires after the artifact
+    is read rather than before — the gate keys on the policy name, which the artifact can supply —
+    so a test reaching it needs the artifact a real run would have generated. Nothing reaches the
+    tenant: the gate raises before any XC call that mutates."""
+    d = out / "policies"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / f"service_policy.{name}.json").write_text(json.dumps(
+        {"metadata": {"name": name}, "spec": {"rules": []}}))
+
+
 def _sim(out, **over):
     (out / "simulation.json").write_text(json.dumps({
         "ts": "2026-07-27T12:00:00Z", "lb": "vpcopilot-lab", "records": 200, "records_replayed": 200,
@@ -41,22 +53,28 @@ def test_simulate_endpoint_is_empty_before_any_run(tmp_path, monkeypatch):
 # ---- the gate: warn + explicit override, audited ----
 def test_an_overbroad_policy_is_refused_without_the_override(tmp_path, monkeypatch):
     _sim(tmp_path)
+    _artifact(tmp_path)
     monkeypatch.setattr(A, "OUT", tmp_path)
     r = _client().post("/api/action", json={"control": "service_policy", "policy_name": "deny-wide",
                                             "finding_id": "f-1", "lb": "lab", "dry_run": False})
     assert r.status_code == 200                       # the job starts…
     job = r.json()["job"]
-    for _ in range(50):
+    # The gate now sits a little further into the job (after the artifact read), so a busy poll with
+    # no sleep can finish before the worker thread does. Nothing reaches the tenant either way:
+    # `XC()` only builds an httpx client, and the raise precedes every request.
+    import time
+    for _ in range(200):
         s = _client().get(f"/api/action?job={job}").json()
         if s["state"] != "running":
             break
+        time.sleep(0.02)
     assert s["state"] == "error" and "allow overbroad" in s["error"]
 
 
 def test_the_override_applies_anyway_and_writes_an_audit_record(tmp_path, monkeypatch):
     _sim(tmp_path)
     monkeypatch.setattr(A, "OUT", tmp_path)
-    monkeypatch.setattr(A, "_dispatch_action", lambda body, log: {"passed": True, "kept": True})
+    monkeypatch.setattr(A, "_dispatch_action", lambda body, log, out: {"passed": True, "kept": True})
     r = _client().post("/api/action", json={"control": "service_policy", "policy_name": "deny-wide",
                                             "finding_id": "f-1", "lb": "lab", "dry_run": False,
                                             "allow_overbroad": True})
@@ -71,7 +89,7 @@ def test_the_override_applies_anyway_and_writes_an_audit_record(tmp_path, monkey
 def test_a_narrow_policy_is_not_gated(tmp_path, monkeypatch):
     _sim(tmp_path)
     monkeypatch.setattr(A, "OUT", tmp_path)
-    monkeypatch.setattr(A, "_dispatch_action", lambda body, log: {"passed": True})
+    monkeypatch.setattr(A, "_dispatch_action", lambda body, log, out: {"passed": True})
     r = _client().post("/api/action", json={"control": "service_policy", "policy_name": "deny-narrow",
                                             "finding_id": "f-2", "lb": "lab", "dry_run": False})
     job = r.json()["job"]
@@ -86,7 +104,7 @@ def test_a_dry_run_is_never_gated(tmp_path, monkeypatch):
     """Dry-run changes nothing, so a blast-radius warning has nothing to gate."""
     _sim(tmp_path)
     monkeypatch.setattr(A, "OUT", tmp_path)
-    monkeypatch.setattr(A, "_dispatch_action", lambda body, log: {"mode": "dry_run"})
+    monkeypatch.setattr(A, "_dispatch_action", lambda body, log, out: {"mode": "dry_run"})
     r = _client().post("/api/action", json={"control": "service_policy", "policy_name": "deny-wide",
                                             "finding_id": "f-1", "lb": "lab", "dry_run": True})
     job = r.json()["job"]
@@ -102,7 +120,7 @@ def test_apply_is_unchanged_when_nothing_was_simulated(tmp_path, monkeypatch):
     """G2 adds a check, not a prerequisite: with no simulation.json the apply path behaves exactly
     as it did before this feature existed."""
     monkeypatch.setattr(A, "OUT", tmp_path)
-    monkeypatch.setattr(A, "_dispatch_action", lambda body, log: {"passed": True, "kept": True})
+    monkeypatch.setattr(A, "_dispatch_action", lambda body, log, out: {"passed": True, "kept": True})
     r = _client().post("/api/action", json={"control": "service_policy", "policy_name": "anything",
                                             "finding_id": "f-9", "lb": "lab", "dry_run": False})
     job = r.json()["job"]

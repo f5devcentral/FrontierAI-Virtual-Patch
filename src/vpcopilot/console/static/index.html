@@ -24,6 +24,11 @@
   .sev-critical{background:#fde7ea;color:#a1001b}.sev-high{background:#fde7e0;color:#a1440b}
   .sev-medium{background:#fff4d6;color:#7a5a00}.sev-low{background:#e8f0fe;color:#1b4fa1}
   .band{color:var(--ok);font-weight:600}.nob{color:var(--amber);font-weight:700}
+  /* `.bad` was used in the H2 dependency preview (parse errors, "could not check …") and never
+     defined, so every one of those rendered as ordinary text — a failure looking exactly like a
+     clean result, which is the one thing that preview exists to prevent. Found while validating J3,
+     whose sink status uses the same class. */
+  .bad{color:#a1001b;font-weight:600}
   .st-found{color:var(--grey)}.st-mitigated{color:var(--amber);font-weight:700}.st-remediated{color:var(--ok);font-weight:700}.st-retired{color:#1b4fa1;font-weight:700}
   label { display:block; font-weight:600; margin:10px 0 4px; }
   input[type=text],input[type=number],select { width:100%; padding:8px; border:1px solid var(--line); border-radius:8px; font:inherit; }
@@ -147,6 +152,20 @@
     <div class="card"><h2>① Scan a repository</h2>
       <p class="sub">Read-only and safe — no XC or GitHub writes happen here. Point it at a vulnerable app (try crapi/VAmPI first — see docs/TRY_IT.md).</p>
       <label>Target repo / directory</label><input type="text" id="scanRepo" list="scanRepoList" placeholder="pick a sibling app repo, or type a path" />
+      <label>…or a security advisory <span class="muted">(H1 — scan a CVE instead of a repo)</span></label>
+      <input type="text" id="scanCve" placeholder="CVE-2024-23334 · GHSA-… · PYSEC-… — resolved from OSV.dev, no credentials needed" />
+      <label>…or an OpenAPI spec <span class="muted">(H3 — find the flaws in the contract; add it to a repo scan to also report spec/code drift)</span></label>
+      <input type="text" id="scanSpec" placeholder="path to openapi.yaml or swagger.json" />
+      <label>…or dependency manifests <span class="muted">(H2 — resolve every pinned package against OSV; comma-separated, alone or alongside a repo)</span></label>
+      <input type="text" id="scanManifest" placeholder="requirements.txt, package-lock.json, pom.xml — no credentials needed" />
+      <div class="rowf">
+        <div><label>Min severity <span class="muted">(manifest)</span></label>
+          <select id="scanMinSeverity"><option>critical</option><option selected>high</option><option>medium</option><option>low</option></select></div>
+        <div><label>Max advisories <span class="muted">(0 = no cap)</span></label><input type="number" id="scanMaxAdvisories" value="25" min="0" /></div>
+        <div><label>&nbsp;</label><button class="mini" onclick="surveyDeps()">Preview (no model calls)</button></div>
+        <div><label>&nbsp;</label><label class="muted"><input type="checkbox" id="scanIncludeDev" /> include dev/test deps</label></div>
+      </div>
+      <div id="depsPreview" style="display:none"></div>
       <div class="rowf">
         <div><label>Output dir</label><input type="text" id="scanOut" list="scanOutList" value="" placeholder="e.g. out-dgx-vampi (or pick a run dir)" /></div>
         <div><label>Min confidence</label><input type="number" id="scanMinConf" value="0.5" step="0.05" min="0" max="1" /></div>
@@ -173,6 +192,18 @@
       <div id="summary" class="chips" style="margin-bottom:12px"></div>
       <div id="reviewBox">Loading…</div>
       <div id="correlations" class="muted" style="margin-top:10px"></div>
+    </div>
+    <div class="card"><h2>One finding, every enforcement point <span class="muted">— emit the same band-aid for the WAF you already own (L1)</span></h2>
+      <div class="rowa">
+        <label style="margin:0 8px 0 0">Target</label>
+        <select id="emitTarget" style="width:auto;min-width:230px"></select>
+        <button class="go" style="margin-top:0" onclick="runEmit()">Emit</button>
+      </div>
+      <p class="sub" style="margin-top:8px">A <b>declarative WAF policy</b>, which BIG-IP Advanced WAF and
+        F5 WAF for NGINX (App Protect) both consume — the two differ only in <span class="mono">template.name</span>.
+        The constraint is derived <b>by code</b> from the recorded exploit and legit requests, not by a model.
+        Read-only: this produces a document and touches no tenant or appliance.</p>
+      <div id="emitBox"></div>
     </div>
   </section>
 
@@ -269,6 +300,25 @@
       <span class="muted repnote"></span>
       <pre id="xcOut" class="logbox" style="display:none"></pre>
     </div>
+    <div class="card"><h2>BIG-IP lab <span class="muted">— the appliance the declarative WAF policy is validated against (L2)</span></h2>
+      <div id="bigipStatus" class="muted">…</div>
+      <button class="go ghost" onclick="loadBigip()">Refresh</button>
+      <p class="sub" style="margin-top:8px">Set <span class="mono">BIGIP_URL</span>,
+        <span class="mono">BIGIP_USER</span> and <span class="mono">BIGIP_PASSWORD</span> above.
+        Create and remove the lab tenant with <span class="mono">vpcopilot bigip-lab create|rm</span> —
+        <span class="mono">/Common</span> is refused outright, and anything in
+        <span class="mono">VPCOPILOT_PROTECTED_BIGIP_TENANTS</span> needs an explicit override.</p>
+    </div>
+    <div class="card"><h2>Audit event sink <span class="muted">— ships every audit entry off the box as it is written</span></h2>
+      <div id="sinkStatus" class="muted">…</div>
+      <button class="go ghost" onclick="checkSink(false)">Refresh</button>
+      <button class="go" onclick="checkSink(true)">Send test event</button>
+      <p class="sub" style="margin-top:8px">Set <span class="mono">VPCOPILOT_AUDIT_SINK</span> above to
+        <span class="mono">https://…</span>, <span class="mono">syslog://host:514</span>,
+        <span class="mono">syslog:///var/run/syslog</span>, <span class="mono">stdout</span> — or
+        <span class="mono">off</span> to disable (a blank field cannot clear a key). The local
+        <span class="mono">audit.log</span> stays authoritative: a sink is a copy, never the record.</p>
+    </div>
     <div class="card"><h2>Agents &amp; models <span class="muted">— model-independent, per-agent in config/agents.yaml</span></h2>
       <div id="wfAgents" class="flow"></div>
     </div>
@@ -293,13 +343,13 @@ function show(id){
   try { history.replaceState(null, "", "#"+id); } catch(e){ location.hash=id; }  // deep-linkable steps
   document.getElementById("settings").style.display = ACTION_STEPS.has(id) ? "block" : "none";
   if(id==="scan"){ loadHero(); }
-  if(id==="review"){ loadResults().then(renderReview); loadHero(); reportNote(); }
+  if(id==="review"){ loadResults().then(renderReview); loadHero(); reportNote(); loadEmitTargets(); }
   if(id==="simulate"){ loadResults().then(renderSimulate); loadSimulation(); loadHero(); }
   if(id==="mitigate"){ loadResults().then(renderMitigate); loadSimulation(); loadHero(); }
   if(id==="cure"){ loadResults().then(renderCure); loadHero(); }
   if(id==="retire"){ loadLedger(); loadAudit(); loadHero(); }
   if(id==="benchmark"){ loadBenchmarks(); }
-  if(id==="setup"){ loadConfig(); loadAgents(); reportNote(); }
+  if(id==="setup"){ loadConfig(); loadAgents(); reportNote(); checkSink(false); loadBigip(); }
 }
 // The report is rebuilt server-side on every open, so it always reflects the LATEST run — name the
 // run dir it comes from, since a scan can repoint it (out-claude-vampi, demo/out, …).
@@ -311,6 +361,11 @@ async function jget(u){ const r=await fetch(u); if(!r.ok) throw new Error((await
 async function jpost(u,b){ const r=await fetch(u,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(b)});
   const d=await r.json().catch(()=>({})); if(!r.ok) throw new Error(d.detail||r.statusText); return d; }
 const esc = s => (s==null?"":String(s)).replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
+// The advisory cap is the one numeric field whose falsy value MEANS something: 0 = no cap. The
+// usual `parseInt(v)||<default>` therefore turns a CLEARED box into an UNBOUNDED resolve, where
+// the CLI defaults to 25 — a two-surfaces divergence that fails in the expensive direction. Blank
+// or unparseable falls back to the CLI default; an explicit 0 is honoured.
+const advCap = v => { const n = parseInt(v); return Number.isFinite(n) && n >= 0 ? n : 25; };
 // ---- log windows ----
 // The scan/apply endpoints serve the FULL transcript and take ?since=<lines already rendered>, so we
 // APPEND the new tail instead of rewriting the node. That keeps scroll position and text selection
@@ -378,10 +433,24 @@ function renderReview(){
   summary.innerHTML = Object.keys(s).length ? [
     chip("candidates", s.candidates), chip("verified", s.verified),
     chip("band-aids", (s.policies||[]).length), chip("code-fix PRs", (s.code_fix_prs||[]).length),
+    // H2: an advisory cure is an upgrade someone else ships — never counted as a drafted PR.
+    (s.dependency_upgrades||[]).length ? chip("upgrades to ship", s.dependency_upgrades.length) : "",
     m.verify?chip("confirm rate", (m.verify.confirm_rate!=null?Math.round(m.verify.confirm_rate*100)+"%":null)):"",
     m.timing_s?chip("scan time", m.timing_s.total+"s"):"",
   ].join("") : '';
   const tri=triMap(), rem=remMap(), pol=polByFinding();
+  // J5 — the CWE/OWASP classification, with its TIER shown rather than hidden. `advisory` means the
+  // OSV record named the weakness (a fact we quote); anything else is the copilot's own
+  // classification, and the two must not read the same way. A finding with no classification shows
+  // nothing here rather than an empty badge, because a blank badge reads as a failed lookup.
+  const wkn=f=>{
+    const bits=[];
+    // The tier is SPELLED, not marked with `*` — `*` already means "recommended" in the band-aid
+    // column of this same row, and one glyph with two meanings on one line is worse than a word.
+    if(f.cwe) bits.push(`<span class="band" title="${f.cwe_source==="advisory"?"the advisory named this weakness — a fact we quote":"the copilot's classification, not a certification"}">${esc(f.cwe)}<span class="muted"> · ${esc(f.cwe_source||"?")}</span></span>`);
+    if(f.owasp) bits.push(`<span class="band">${esc(f.owasp)}</span>`);
+    return bits.length?`<div style="margin-top:3px;font-size:11px">${bits.join(" ")}</div>`:"";
+  };
   const rows=verified().map(f=>{
     const d=tri[f.id];
     const bands = d.no_bandaid ? '<span class="nob">no band-aid — code cure only</span>'
@@ -390,7 +459,7 @@ function renderReview(){
     return `<tr>
       <td><span class="caret" onclick="toggleDetail('${f.id}')">▸</span> <b>${esc(f.title||f.id)}</b><div class="mono muted" style="font-size:11px">${esc(f.id)}</div></td>
       <td><span class="pill sev-${f.severity}">${f.severity}</span></td>
-      <td>${esc(f.vuln_class)}</td>
+      <td>${esc(f.vuln_class)}${wkn(f)}</td>
       <td class="mono">${esc(f.file)}${ep}</td>
       <td>${bands}</td>
       <td class="muted">${esc(d.residual_risk||"")}</td></tr>
@@ -771,8 +840,27 @@ async function doRetire(fid){
   const st=S(); const out=document.getElementById("ret-"+fid);
   if(!confirm(`Retire the band-aid for ${fid}? (detaches the live XC control${st.allow?"":"; needs allow-protected for a protected LB"})`)) return;
   out.className="act"; out.textContent=" retiring…";
-  try { const r=await jpost("/api/retire",{finding_id:fid,force:true,allow_protected_lb:st.allow});
+  // force:false — ASK the server, do not pre-authorise. The console used to hardcode force:true,
+  // which meant the "is the cure PR actually merged?" gate that the CLI and MCP enforce could not
+  // be enforced from the GUI at all: every console retire skipped it. Warn-with-audited-override,
+  // not a silent bypass — if the gate blocks, the operator gets the reason and an explicit button.
+  try { const r=await jpost("/api/retire",{finding_id:fid,force:false,allow_protected_lb:st.allow});
+    if(String(r.status||"").startsWith("skipped")){
+      out.className="act err";
+      out.innerHTML=" "+esc(r.status)+' <button class="mini" onclick="retireAnyway(\''+fid+'\')">retire anyway ▶</button>';
+      return;
+    }
     out.className="act ok"; out.textContent=" "+(r.status||"retired"); loadLedger(); loadAudit(); loadHero();
+  } catch(e){ out.className="act err"; out.textContent=" "+e.message; }
+}
+
+async function retireAnyway(fid){
+  const st=S(); const out=document.getElementById("ret-"+fid);
+  if(!confirm(`Retire ${fid} WITHOUT a merged cure PR?\n\nThe band-aid is the only thing currently `
+    + `blocking this vulnerability. Detaching it before the code fix ships re-exposes the app.`)) return;
+  out.className="act"; out.textContent=" retiring (forced)…";
+  try { const r=await jpost("/api/retire",{finding_id:fid,force:true,allow_protected_lb:st.allow});
+    out.className="act ok"; out.textContent=" "+(r.status||"retired")+" (forced)"; loadLedger(); loadAudit(); loadHero();
   } catch(e){ out.className="act err"; out.textContent=" "+e.message; }
 }
 
@@ -852,10 +940,88 @@ function renderBenchmark(){
 
 // ---- setup ----
 async function loadConfig(){ const c=await jget("/api/config");
-  cfg.innerHTML=Object.entries(c).map(([k,v])=>`<label>${k} ${v.set?'<span class="band">(set)</span>':'<span class="muted">(unset)</span>'}</label>
-    <input type="text" id="cfg-${k}" value="${v.secret?'':(v.value||'')}" placeholder="${v.secret?(v.set?'•••• (unchanged unless you type)':'enter value'):''}" />`).join(""); }
+  // Three states, not two. A value supplied through the process ENVIRONMENT used to render as
+  // "(unset)" — so this page said BIGIP_URL was unset directly above a panel talking to the
+  // appliance over it. Saying WHERE it came from also warns that .env will not win: the
+  // environment value still takes precedence, so a save here would look applied and not be.
+  cfg.innerHTML=Object.entries(c).map(([k,v])=>`<label>${k} ${
+      v.source==='env-file' ? '<span class="band">(set)</span>'
+    : v.source==='environment' ? '<span class="band" title="Set in this process\u2019s environment, not in .env. Saving here writes .env, but the environment value still wins until the console is restarted.">(set in environment)</span>'
+    : '<span class="muted">(unset)</span>'}</label>
+    <input type="text" id="cfg-${k}" value="${(v.secret||v.redacted)?'':(v.value||'')}" placeholder="${
+      v.secret ? (v.set?'•••• (unchanged unless you type)':'enter value')
+      : v.redacted ? (v.set? esc(v.value)+' (unchanged unless you type)' : 'enter value')
+      : ''}" />`).join(""); }
 async function saveConfig(){ const u={}; document.querySelectorAll("[id^=cfg-]").forEach(i=>{ if(i.value) u[i.id.slice(4)]=i.value; });
   await jpost("/api/config",{updates:u}); await loadConfig(); alert("Saved to .env"); }
+// L1 — the emit panel. The targets come from the registry, not a hardcoded list here, so adding a
+// target really does touch only the emitter module.
+async function loadEmitTargets(){
+  const sel=document.getElementById("emitTarget");
+  if(sel.options.length) return;
+  let d; try { d=await jget("/api/emit-targets"); } catch(e){ return; }
+  sel.innerHTML=d.targets.map(t=>`<option value="${esc(t.key)}">${esc(t.display)}</option>`).join("");
+  sel.value="bigip-awaf";
+}
+async function runEmit(){
+  const box=document.getElementById("emitBox"); box.innerHTML='<p class="muted">emitting…</p>';
+  let d; try { d=await jpost("/api/emit",{target:document.getElementById("emitTarget").value}); }
+  catch(e){ box.innerHTML='<p class="bad">'+esc(e.message)+'</p>'; return; }
+  if(!d.results.length){ box.innerHTML='<p class="muted">no generated band-aids in this run yet — scan first.</p>'; return; }
+  // Every candidate is listed, INCLUDING the ones that declined: "we did not emit this" and
+  // "there was nothing to emit" are different answers and only one of them is a gap.
+  const rows=d.results.map(r=>{
+    const ok=r.supported;
+    const why=ok?(r.reason?`<span class="nob">⚠ ${esc(r.reason)}</span>`:"")
+                :`<span class="muted">${esc(r.reason)}</span>`;
+    const derived=r.derived_from&&r.derived_from.parameter
+      ? `<code>${esc(r.derived_from.parameter)} ≥ ${esc(r.derived_from.minimum)}</code>
+         <span class="muted">derived from ${esc(r.derived_from.exploit_value)} vs ${esc(r.derived_from.legit_value)}</span>` : "";
+    return `<tr><td class="mono">${esc(r.finding_id||"")}</td><td>${esc(r.control)}</td>
+      <td class="mono">${esc(r.policy_name)}</td>
+      <td>${ok?'<span class="band">emitted</span>':'<span class="nob">unsupported</span>'}</td>
+      <td>${derived}${why}</td></tr>`;}).join("");
+  box.innerHTML=`<p class="sub">${d.emitted} of ${d.results.length} emitted for <b>${esc(d.display)}</b>.</p>
+    <table><thead><tr><th>finding</th><th>control</th><th>policy</th><th></th><th>constraint / why not</th></tr></thead>
+    <tbody>${rows}</tbody></table>`;
+}
+// L2 — "reachable" and "AS3 installed" are different facts and must not render the same: the PAYG
+// images ship WITHOUT AS3, so an appliance that answers perfectly can still be unable to take a
+// declaration, and that needs a different fix from one that cannot be reached.
+async function loadBigip(){ const box=document.getElementById("bigipStatus");
+  box.textContent="checking…";
+  let s; try { s=await jget("/api/bigip-lab"); }
+  catch(e){ box.innerHTML='<span class="bad">'+esc(e.message)+'</span>'; return; }
+  if(!s.configured){ box.innerHTML='<span class="muted">no BIG-IP configured — set BIGIP_URL, BIGIP_USER and BIGIP_PASSWORD</span>'; return; }
+  if(!s.reachable){ box.innerHTML='<span class="bad">unreachable — '+esc(s.reason)+'</span>'; return; }
+  const bits=[];
+  bits.push(s.as3 ? `AS3 <b>${esc(s.as3)}</b>` : '<span class="bad">AS3 not installed</span>');
+  bits.push('tenants: '+(s.tenants.length?s.tenants.map(t=>`<span class="mono">${esc(t)}</span>`).join(", "):'<span class="muted">(none)</span>'));
+  if(s.protected&&s.protected.length) bits.push('protected: '+s.protected.map(t=>`<span class="mono">${esc(t)}</span>`).join(", "));
+  if(s.reason) bits.push('<span class="bad">'+esc(s.reason)+'</span>');
+  box.innerHTML=bits.join(" · ");
+}
+// J3 — a sink that is configured and silently not delivering is the failure this panel exists to
+// make visible: the run succeeds either way, so "unset" and "set but unreachable" must never
+// render the same. `send` is the only thing here that touches the network.
+async function checkSink(send){ const box=document.getElementById("sinkStatus");
+  box.textContent = send ? "sending test event…" : "checking…";
+  let s; try { s = send ? await jpost("/api/audit-sink",{send:true}) : await jget("/api/audit-sink"); }
+  catch(e){ box.innerHTML='<span class="bad">'+esc(e.message)+'</span>'; return; }
+  if(!s.configured){ box.innerHTML='<span class="muted">'+esc(s.reason)+'</span>'; return; }
+  if(!s.usable){ box.innerHTML='<span class="bad">unusable — '+esc(s.reason)+'</span>'; return; }
+  const bits=[`<b>${esc(s.kind)}</b> → <span class="mono">${esc(s.target)}</span>`,
+    s.token_set?'auth token set':'no auth token',
+    `delivered ${s.delivered}/${s.attempted}`+(s.failed?`, <span class="bad">${s.failed} failed</span>`:"")+
+      (s.suppressed?`, ${s.suppressed} suppressed (cooldown)`:"")];
+  if(s.last_error) bits.push('last error: <span class="bad">'+esc(s.last_error)+'</span>');
+  // Three states, not two. UDP cannot acknowledge, so "the datagram left this host" must not be
+  // painted the same green as "the collector answered" (the J2 present-unverified precedent).
+  if(s.delivery==="sent") bits.push('test delivery: <span class="band">sent</span>');
+  else if(s.delivery==="sent-unconfirmed") bits.push('test delivery: <span class="nob">sent, unconfirmed</span> <span class="muted">(UDP cannot acknowledge — this proves it left this host, not that anything received it)</span>');
+  else if(s.delivery) bits.push('test delivery: <span class="bad">'+esc(s.delivery)+'</span>');
+  box.innerHTML=bits.join(" · ");
+}
 async function loadAgents(){ let a; try { a=await jget("/api/agents"); } catch(e){ wfAgents.textContent="error: "+e.message; return; }
   wfAgents.innerHTML = a.agents.map(x=>`<div class="stage"><h4>${esc(x.name)}</h4><div class="m">${esc(x.model)}</div><div class="r">${esc(x.role)}</div></div>`).join('<div class="arrow">→</div>'); }
 async function xcStatus(){ const out=document.getElementById("xcOut"); out.style.display="block"; out.textContent="checking…";
@@ -864,9 +1030,50 @@ async function xcStatus(){ const out=document.getElementById("xcOut"); out.style
 // ---- scan (auto-advances to Review on done) ----
 let SCAN_N = 0;  // lines already appended — the server streams the transcript from here
 scanLog.addEventListener("scroll",()=>{ scanFollow.style.display = atBottom(scanLog) ? "none" : "inline-block"; });
-async function runScan(){ const repo=scanRepo.value.trim(); if(!repo){alert("enter a repo path");return;}
+// H2 — the manifest field is a comma-separated list, so one scan can cover a service's
+// requirements.txt and its package-lock.json together.
+function manifestPaths(){ return scanManifest.value.split(",").map(s=>s.trim()).filter(Boolean); }
+async function surveyDeps(){
+  // The read-only half: same module function the CLI's `vpcopilot deps` calls, so the preview and
+  // the scan can never disagree about which advisories are in scope.
+  const manifest=manifestPaths();
+  if(!manifest.length){alert("enter at least one manifest path");return;}
+  depsPreview.style.display="block"; depsPreview.innerHTML='<p class="muted">asking OSV…</p>';
+  let r; try { r=await jpost("/api/deps",{manifest,min_severity:scanMinSeverity.value,max_advisories:advCap(scanMaxAdvisories.value),include_dev:scanIncludeDev.checked}); }
+  catch(e){ depsPreview.innerHTML='<p class="bad">'+esc(e.message)+'</p>'; return; }
+  depsPreview.innerHTML=depsTable(r.dependencies);
+}
+function depsTable(d){
+  if(!d) return '<p class="muted">no dependency data</p>';
+  const f=d.funnel;
+  const chips=[["packages",f.packages_parsed],["vulnerable",f.packages_vulnerable],["advisories",f.advisories_distinct],
+               ["would resolve",f.would_resolve||f.resolved],["not resolved",f.not_resolved],["could not pin",f.packages_unpinned]]
+    .map(([k,v])=>'<span class="chip">'+k+': <b>'+v+'</b></span>').join("");
+  const rows=(d.advisories||[]).slice(0,60).map(a=>`<tr>
+      <td><span class="pill sev-${esc(a.severity)}">${esc(a.severity)}</span></td>
+      <td class="mono">${esc(a.package)}</td><td class="mono">${esc(a.installed)}</td>
+      <td class="mono">${esc(a.advisory_id)}</td>
+      <td class="mono">${a.fixed_version?esc(a.fixed_version):'<span class="muted">none published</span>'}</td>
+      <td class="muted">${esc(a.disposition)}${a.reason?` — ${esc(String(a.reason).slice(0,90))}`:""}</td></tr>`).join("");
+  // The unpinned list is shown, not hidden: "we did not check this" must never look like "clean".
+  const un=(d.unpinned||[]).length? `<p class="muted">${d.unpinned.length} entry(ies) could NOT be pinned and were not checked: `+
+    esc([...new Set(d.unpinned.map(u=>u.reason))].join(", "))+'</p>' : "";
+  // A manifest that could not be READ at all returned an all-zero funnel and an empty table —
+  // visually identical to previewing a genuinely clean one. The CLI printed these in red all
+  // along; the console dropped them, so the guard lived on only one surface.
+  const errs=(d.errors||[]).map(e=>`<p class="bad">⚠ ${esc(e.path)}: ${esc(e.error)}</p>`).join("");
+  const unck=(d.unchecked||[]).map(u=>`<p class="bad">could not check ${esc(u.ecosystem)}/${esc(u.name)} `+
+    `${esc(u.version)} — ${esc(u.error)}; its advisories are UNKNOWN, not absent</p>`).join("");
+  const more=(d.advisories||[]).length>60?`<p class="muted">… ${d.advisories.length-60} more in dependencies.json</p>`:"";
+  return `<div class="chips">${chips}</div>${errs}${unck}${un}<table><thead><tr><th>sev</th><th>package</th><th>installed</th><th>advisory</th><th>fixed</th><th>disposition</th></tr></thead><tbody>${rows}</tbody></table>${more}`;
+}
+async function runScan(){ const repo=scanRepo.value.trim(), cve=scanCve.value.trim(), spec=scanSpec.value.trim(), manifest=manifestPaths();
+  // repo and --cve are alternatives; a spec and a manifest are additive. The server enforces this
+  // too — this is just a faster no.
+  if(!repo && !cve && !spec && !manifest.length){alert("enter a repo path, a CVE/GHSA id, an OpenAPI spec, or a dependency manifest");return;}
+  if(cve && (repo || spec || manifest.length)){alert("a CVE scan cannot be combined with a repo, a spec or a manifest");return;}
   scanState.textContent="starting…";
-  try { await jpost("/api/scan",{repo,out:scanOut.value.trim()||"out",min_confidence:parseFloat(scanMinConf.value)||0.5,max_files:parseInt(scanMaxFiles.value)||200,max_bytes:parseInt(scanMaxBytes.value)||60000,draft_code_fixes:scanRemediate.checked}); } catch(e){ scanState.textContent="error: "+e.message; return; }
+  try { await jpost("/api/scan",{repo,cve,spec,manifest,min_severity:scanMinSeverity.value,max_advisories:advCap(scanMaxAdvisories.value),include_dev:scanIncludeDev.checked,out:scanOut.value.trim()||"out",min_confidence:parseFloat(scanMinConf.value)||0.5,max_files:parseInt(scanMaxFiles.value)||200,max_bytes:parseInt(scanMaxBytes.value)||60000,draft_code_fixes:scanRemediate.checked}); } catch(e){ scanState.textContent="error: "+e.message; return; }
   SCAN_N=0; scanLog.textContent=""; scanLogCount.textContent=""; scanLogWrap.style.display="block";
   const poll=setInterval(async()=>{
     let s; try { s=await jget("/api/scan?since="+SCAN_N); } catch(e){ return; }  // transient fetch blip — keep polling

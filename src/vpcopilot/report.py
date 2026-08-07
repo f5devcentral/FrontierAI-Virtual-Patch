@@ -11,6 +11,12 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
+# The agents named in the report's model table. One of the FOUR places a new agent must be
+# registered (config.AGENT_NAMES, console.AGENT_ROLES, here, bench_model.AGENTS) — see
+# tests/test_inputs_cve.py::test_the_resolve_agent_is_registered_everywhere_it_has_to_be.
+REPORTED_AGENTS = ("resolve", "discover", "verify", "triage", "generate", "remediate",
+                   "probe", "refine")
+
 SEV_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3}
 
 _CSS = """
@@ -64,7 +70,12 @@ footer{color:var(--grey);font-size:12px;padding:20px 28px;text-align:center}
 .bars{display:flex;gap:24px;flex-wrap:wrap}.bars .grp{flex:1;min-width:240px}
 .bar{display:flex;align-items:center;gap:8px;margin:4px 0;font-size:12px}
 .bar .lab{width:96px;color:var(--grey)}.bar .track{flex:1;background:var(--bg);border-radius:6px;height:14px;overflow:hidden;border:1px solid var(--line)}
-.bar .fill{height:100%;border-radius:6px}.bar .v{width:24px;text-align:right;font-weight:700}
+.bar /* `display:block` is load-bearing: `.fill` is a <span>, and an INLINE element ignores both height
+   and a percentage width. The width and colour were being computed correctly all along
+   (`style="width:33%;background:#a1001b"`) and silently discarded, so C5's severity and control
+   bars have never actually drawn a bar — every track rendered empty. Found while adding the J5
+   OWASP group, when all three charts were uniformly blank. */
+.fill{display:block;height:100%;border-radius:6px}.bar .v{width:24px;text-align:right;font-weight:700}
 .models{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
 .model{background:#fff;border:1px solid var(--line);border-radius:20px;padding:3px 11px;font-size:12px}
 .model .a{color:var(--grey)}.model .m{font-family:ui-monospace,Menlo,monospace;color:var(--f5)}
@@ -112,7 +123,19 @@ def _finding_card(f: dict, decision: dict | None, rem: dict | None) -> str:
         cov = f' <span class="cov">· {_e(b.get("coverage", ""))}</span>'
         ba.append(f'<span class="ba{rec}">{_e(b.get("control", ""))}{cov}</span>')
     if rem:
-        ba.append('<span class="cure">✓ code fix drafted</span>')
+        # A `dependency_upgrade` is NOT a drafted code fix: there is no file to patch and `pr.py`
+        # writes no diff for it — the cure is "bump the version in someone else's package". Keying
+        # the badge on the mere PRESENCE of a remediation made a card claim "✓ code fix drafted"
+        # while the hero on the SAME page correctly reported 0 code-fix PRs and 1 upgrade to ship.
+        if (rem.get("kind") or "code_fix") == "dependency_upgrade":
+            pkg, ver = rem.get("package") or "", rem.get("fixed_version") or ""
+            detail = f" — {_e(pkg)} → {_e(ver)}" if pkg and ver else ""
+            ba.append(f'<span class="cure">↑ dependency upgrade{detail}</span>')
+        elif rem.get("patched_content") or rem.get("diff"):
+            ba.append('<span class="cure">✓ code fix drafted</span>')
+        else:
+            # A plan with no patch is not a drafted fix. Saying so beats a tick that is not true.
+            ba.append('<span class="cure nob">cure planned — no patch drafted</span>')
     ba.append("</div>")
     parts.append("".join(ba))
 
@@ -210,8 +233,44 @@ def _hero_html(im: dict) -> str:
             + f'<div class="h dim"><span class="n red">{_e(im["change_control_days"])} days</span>'
               '<span class="l">normal change control</span></div>'
             + h(im["code_prs"], "code-fix PRs (the cure)")
+            # H2: an advisory's cure is an upgrade in someone else's package — no PR was drafted
+            # and none can be. Shown beside the PR count, never folded into it. Omitted entirely
+            # when there are none, so a repo-only report is unchanged.
+            + (h(im["dependency_upgrades"], "upgrades to ship (no PR)")
+               if im.get("dependency_upgrades") else "")
             + dash_link
             + '</div>')
+
+
+def _weakness_note(ws: dict) -> str:
+    """The honesty line under the OWASP chart.
+
+    J5's acceptance requires the mapping to read as *the tool's classification*, not a
+    certification claim. It also has to say why some findings carry nothing — several classes have
+    no honest mapping (CWE-840 is PROHIBITED by MITRE; Injection left the API Top 10 in 2023), and
+    a blank that looks like an oversight is worse than one that explains itself.
+
+    The two reasons are reported separately. `weakness.summary` splits them because only the class
+    table can: a declined class is a RESULT, an unstamped finding is a DEFECT, and collapsing them
+    into one sentence would state a reason this function cannot know."""
+    if not ws["total"]:
+        return ""
+    bits = [f'{ws["total"] - ws["unclassified"]} of {ws["total"]} findings carry a CWE or an '
+            f'OWASP category.']
+    if ws.get("declined"):
+        bits.append(f'{ws["declined"]} carry neither because no honest mapping exists for their '
+                    f'class — considered and declined, not skipped.')
+    if ws.get("unstamped"):
+        # NOT merged into the line above: their class DOES map, so a blank here means the finding
+        # never went through the stamp — it predates J5 or reached the report by a path that
+        # bypassed the pipeline. Reporting that as "no honest mapping exists" would be a confident
+        # false reason, which is worse than the blank it explains.
+        bits.append(f'<strong>{ws["unstamped"]} were never classified</strong> even though their '
+                    f'class does map — they predate this feature or bypassed the pipeline.')
+    bits.append('This is the copilot\'s classification (or, where marked <code>advisory</code>, '
+                'the advisory\'s own), not a certification that any control is satisfied.')
+    return ('<p class="sub" style="margin-top:6px;font-size:12px;color:#6a7282">'
+            + " ".join(bits) + "</p>")
 
 
 def _bars_html(findings: list, summary: dict) -> str:
@@ -239,7 +298,23 @@ def _bars_html(findings: list, summary: dict) -> str:
 
     sev = _grp("Findings by severity", {k: sev_c[k] for k in SEV_ORDER}, lambda k: sev_col.get(k, "#6a7282"))
     ctrl = _grp("Band-aids by XC control", ctrl_c, lambda k: "#1b2a4a")
-    return f'<h2>At a glance</h2><div class="bars">{sev}{ctrl}</div>'
+
+    # J5 — group by OWASP API Top 10 category. The residual bar is every finding WITHOUT a
+    # category, which is not the same set as `unclassified` (no CWE *and* no OWASP): an sqli
+    # finding carries CWE-89 but no category, because Injection left the API Top 10 in 2023. Using
+    # `unclassified` here put those in no bar at all, so the chart quietly summed to less than the
+    # total — a chart that undercounts is the exact failure this item exists to avoid. The residual
+    # is therefore derived from the total, and asserted below so it cannot drift again.
+    from .weakness import summary as _weakness_summary
+    ws = _weakness_summary(findings)
+    owasp_c = dict(ws["by_owasp"])
+    no_cat = ws["total"] - sum(ws["by_owasp"].values())
+    if no_cat:
+        owasp_c["(no category)"] = no_cat
+    assert sum(owasp_c.values()) == ws["total"], "the OWASP chart does not account for every finding"
+    owasp = _grp("Findings by OWASP API Top 10", owasp_c,
+                 lambda k: "#6a7282" if k.startswith("(") else "#4b57b8")
+    return f'<h2>At a glance</h2><div class="bars">{sev}{ctrl}{owasp}</div>{_weakness_note(ws)}'
 
 
 def _models_html() -> str:
@@ -248,7 +323,11 @@ def _models_html() -> str:
         from .config import load_config
         import os
         cfg = load_config(os.environ.get("VPCOPILOT_CONFIG", "config/agents.yaml"))
-        agents = ["discover", "verify", "triage", "generate", "remediate", "probe", "refine"]
+        # Module-level so a test can assert on the LIST rather than grepping the file. The
+        # registration guard used a whole-file substring search for "resolve", which the word
+        # "resolved" elsewhere in this module already satisfied — so the guard passed with the
+        # agent missing from exactly the list it was guarding.
+        agents = list(REPORTED_AGENTS)
         chips = "".join(f'<span class="model"><span class="a">{a}</span> · <span class="m">{_e(cfg.for_agent(a).model)}</span></span>'
                         for a in agents)
     except Exception:  # noqa: BLE001
@@ -272,13 +351,34 @@ def _blast_radius_html(out_dir: str) -> str:
     rows = ""
     for p in pols:
         rate = f'{(p.get("block_rate") or 0) * 100:.1f}%'
-        verdict = ('<span class="st-mitigated">over threshold</span>' if p.get("blocked_promotion")
-                   else ('<span class="cls">error</span>' if p.get("error")
-                         else '<span class="st-remediated">within threshold</span>'))
+        # NOT-MEASURED is a third verdict, not a green one. `simulate` computes `evaluated`,
+        # `errored`, `enforcement_confirmed` and `reason` and the table used none of them, so a
+        # replay in which EVERY request failed in transit (evaluated=0, errored=12,
+        # reason="nothing measurable") rendered as "within threshold" — a 0.0% block rate that
+        # means "we measured nothing", presented as "this policy is safe to promote".
+        evaluated = p.get("evaluated") or 0
+        errored = p.get("errored") or 0
+        if p.get("blocked_promotion"):
+            verdict = '<span class="st-mitigated">over threshold</span>'
+        elif p.get("error"):
+            verdict = '<span class="cls">error</span>'
+        elif not evaluated:
+            verdict = ('<span class="st-found" title="No request was successfully evaluated, so '
+                       'the block rate is not a measurement">not measured</span>')
+            rate = "—"
+        elif p.get("enforcement_confirmed") is False:
+            verdict = ('<span class="st-found" title="The policy was not confirmed to be enforcing '
+                       'during the replay">unconfirmed</span>')
+        else:
+            verdict = '<span class="st-remediated">within threshold</span>'
+        why = p.get("reason") or ""
+        if errored:
+            why = (why + " · " if why else "") + f"{errored} request(s) failed in transit"
         top = ", ".join(f'{_e(t[0])} ×{_e(t[1])}' for t in (p.get("top_paths") or [])[:3]) or "—"
         rows += (f'<tr><td class="file">{_e(p.get("policy_name"))}</td>'
                  f'<td>{_e(p.get("evaluated"))}</td><td><b>{_e(p.get("would_block"))}</b></td>'
-                 f'<td>{rate}</td><td>{verdict}</td><td class="cls">{top}</td></tr>')
+                 f'<td>{rate}</td><td>{verdict}</td><td class="cls">{top}</td>'
+                 f'<td class="cls">{_e(why) or "—"}</td></tr>')
     meta = (f'{_e(sim.get("records_replayed"))} of {_e(sim.get("records"))} recorded request(s) '
             f'replayed through {_e(sim.get("lb"))}')
     if sim.get("window"):
@@ -288,7 +388,61 @@ def _blast_radius_html(out_dir: str) -> str:
     return ('<h2>Blast radius <span class="cls">what each band-aid would block in recorded '
             f'traffic — {meta}</span></h2>'
             '<table><tr><th>policy</th><th>evaluated</th><th>would block</th><th>rate</th>'
-            f'<th>verdict</th><th>top blocked paths</th></tr>{rows}</table>')
+            f'<th>verdict</th><th>top blocked paths</th><th>caveats</th></tr>{rows}</table>')
+
+
+def _dependencies_html(out_dir: str) -> str:
+    """H2: the dependency funnel, INCLUDING what was not checked.
+
+    Two counts carry most of the honesty here and both are rendered even when zero: entries whose
+    version could not be pinned (never queried, so nothing is known about them) and advisories held
+    back by the severity floor or the cap (found and listed, but never sent to an agent). A
+    dependency report that showed only the resolved rows would read as a clean bill of health for
+    packages it never looked at."""
+    dep = _load(Path(out_dir), "dependencies.json", None)
+    if not dep:
+        return ""
+    f = dep.get("funnel") or {}
+    s = dep.get("settings") or {}
+    chips = "".join(_chip(f.get(k, 0), lbl) for k, lbl in (
+        ("packages_parsed", "packages"), ("packages_vulnerable", "vulnerable"),
+        ("advisories_distinct", "advisories"), ("exploitable", "exploitable"),
+        ("declined", "declined"), ("not_resolved", "not resolved"),
+        ("packages_unpinned", "could not pin")))
+    rows = ""
+    for a in (dep.get("advisories") or [])[:80]:
+        fixed = _e(a.get("fixed_version")) or f'<span class="cls">{_e(a.get("fix_note")) or "none published"}</span>'
+        rows += (f'<tr><td><span class="pill sev-{_e(a.get("severity"))}">{_e(a.get("severity"))}</span></td>'
+                 f'<td class="file">{_e(a.get("package"))}</td><td>{_e(a.get("installed"))}</td>'
+                 f'<td class="file">{_e(a.get("advisory_id"))}</td><td>{fixed}</td>'
+                 f'<td>{_e(a.get("disposition"))}</td>'
+                 f'<td class="cls">{_e(str(a.get("reason") or "")[:140])}</td></tr>')
+    extra = ""
+    n_un = len(dep.get("unpinned") or [])
+    if n_un:
+        reasons = ", ".join(sorted({u.get("reason", "") for u in dep["unpinned"]}))
+        extra += ('<p class="cls"><b>Not checked.</b> '
+                  f'{n_un} manifest entry(ies) could not be pinned to an exact version and were '
+                  f'never queried ({_e(reasons)}). Nothing is known about them — this is not a '
+                  'statement that they are clean.</p>')
+    if f.get("not_resolved"):
+        extra += ('<p class="cls"><b>Listed, not resolved.</b> '
+                  f'{f["not_resolved"]} advisory(ies) were found but not sent to an agent '
+                  f'(--min-severity {_e(s.get("min_severity"))}, --max-advisories '
+                  f'{_e(s.get("max_advisories"))}). They are in the table with the reason.</p>')
+    # A package the batch flagged as vulnerable but whose advisory fetch then failed used to appear
+    # here exactly like one that came back clean: no row, no counter, no warning.
+    for u in dep.get("unchecked") or []:
+        extra += ('<p class="cls"><b>Could not check.</b> '
+                  f'{_e(u.get("ecosystem"))}/{_e(u.get("name"))} {_e(u.get("version"))} — '
+                  f'{_e(u.get("error"))}. Its advisories are unknown, not absent.</p>')
+    for e in dep.get("errors") or []:
+        extra += f'<p class="cls">⚠ {_e(e.get("path"))}: {_e(e.get("error"))}</p>'
+    return ('<h2>Dependencies <span class="cls">pinned packages resolved against OSV.dev — '
+            'the vulnerability is in code you do not own, so the cure is a version bump</span></h2>'
+            f'<div class="chips">{chips}</div>{extra}'
+            '<table><tr><th>sev</th><th>package</th><th>installed</th><th>advisory</th>'
+            f'<th>fixed in</th><th>disposition</th><th>why</th></tr>{rows}</table>')
 
 
 def build_report(out_dir: str = "out") -> str:
@@ -314,7 +468,16 @@ def build_report(out_dir: str = "out") -> str:
     rem = {r.get("finding_id"): r for r in remediations}
     findings = sorted(findings, key=lambda f: (SEV_ORDER.get(f.get("severity"), 9), f.get("id", "")))
 
-    n_band = sum(1 for f in findings if tri.get(f.get("id"), {}).get("bandaids"))
+    # `findings.json` holds every CANDIDATE; `triage.json` holds only the ones the verify agent
+    # CONFIRMED. The report rendered all of them in one list, so a candidate verify had REFUTED sat
+    # on the page looking exactly like a confirmed one — 25 cards under a hero reading 9, on the
+    # artifact whose job is to be trustworthy. Split rather than filter: dropping the refuted ones
+    # would hide that the tool considered and rejected them, and "we did not check this" and "we
+    # checked and it did not hold" are different answers that must not render the same way either.
+    verified = [f for f in findings if f.get("id") in tri]
+    refuted = [f for f in findings if f.get("id") not in tri]
+
+    n_band = sum(1 for f in verified if tri.get(f.get("id"), {}).get("bandaids"))
     chips = "".join([
         _chip(summary.get("candidates", len(findings)), "candidates"),
         _chip(summary.get("verified", len(findings)), "verified"),
@@ -322,9 +485,22 @@ def build_report(out_dir: str = "out") -> str:
         _chip(len(summary.get("no_bandaid", [])), "code-cure only"),
         _chip(len(summary.get("policies", [])), "XC policies"),
         _chip(len(summary.get("code_fix_prs", remediations)), "code-fix PRs"),
-    ])
+    ] + ([_chip(len(summary.get("dependency_upgrades", [])), "upgrades to ship")]
+         if summary.get("dependency_upgrades") else []))
 
-    cards = "".join(_finding_card(f, tri.get(f.get("id")), rem.get(f.get("id"))) for f in findings)
+    cards = "".join(_finding_card(f, tri.get(f.get("id")), rem.get(f.get("id"))) for f in verified)
+    if refuted:
+        # Rendered, but below the fold and unmistakably labelled. The count is stated so the page
+        # accounts for every candidate rather than quietly showing a subset.
+        rc = "".join(_finding_card(f, None, rem.get(f.get("id"))) for f in refuted)
+        cards += (
+            '<h2 style="margin-top:26px">Candidates the verify agent did not confirm</h2>'
+            f'<p class="sub">{len(refuted)} of {len(findings)} candidates. The discover agent '
+            'proposed these; the adversarial verify step could not confirm them, so they carry no '
+            'band-aid and are <strong>not</strong> counted anywhere else on this page. They are '
+            'shown because "considered and rejected" is a result worth seeing — not because they '
+            'are findings.</p>'
+            f'<div class="refuted" style="opacity:.72">{rc}</div>')
 
     # band-aid policies grouped by control
     pol_html = ""
@@ -381,9 +557,10 @@ def build_report(out_dir: str = "out") -> str:
 <main>
 {_hero_html(im)}
 <h2>Run summary</h2><div class="chips">{chips}</div>
-{_bars_html(findings, summary)}
+{_bars_html(verified, summary)}
 {_models_html()}
 {_metrics_html(metrics)}
+{_dependencies_html(out_dir)}
 <h2>Findings &amp; band-aid coverage</h2>{cards or '<p class="cls">No findings.</p>'}
 <h2>Generated XC band-aid policies</h2>{pol_html or '<p class="cls">None.</p>'}
 {impact_html}

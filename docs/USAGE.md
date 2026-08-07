@@ -40,6 +40,154 @@ Runs `discover → verify → triage → generate → remediate` and writes to `
 `findings.json`, `triage.json`, `policies/*.json` (XC specs), `remediations/*.patch|.pr.md`
 (code fixes), `correlations.json`, `ledger.json`, `summary.json`. No XC/GitHub writes.
 
+### Scan a CVE instead of a repo (H1)
+
+The vulnerabilities most people lose sleep over live in dependencies they do not own, where the
+code cure is a version bump someone else has to ship and they then have to deploy. That gap is what
+virtual patching is for.
+
+```sh
+vpcopilot scan --cve CVE-2024-23334 --out out       # or GHSA-…, PYSEC-…, GO-…, RUSTSEC-…
+```
+
+The advisory is resolved from **OSV.dev** (no credentials — `scan` stays safe to run anywhere), the
+`resolve` agent derives its HTTP exploitation profile, and the result enters the same triage and
+generate stages as a code finding. `--cve` and a repo path are mutually exclusive.
+
+**The agent is expected to decline.** Many advisories cannot be virtually patched at a load
+balancer — a malicious build-time dependency, a bug reachable only from a local file, memory
+corruption with no request signature. Those route to `no_bandaid` with the residual risk stated,
+and that routing is decided **in code**, not asked of the model: a hard requirement should not
+depend on a prompt being honoured. An agent that obligingly invented a plausible path for every CVE
+would be worse than no advisory input at all — it would produce confident band-aids that block
+nothing while hiding a real vulnerability behind a green check.
+
+**The cure is a version bump, never a patch.** `remediate` is not called on this path. The fixed
+version is copied from OSV by code — it is the one string an operator acts on directly, so no model
+goes near it — and `vpcopilot pr` reports the upgrade and opens nothing:
+
+```
+advisory: upgrade aiohttp to 3.9.2 — no PR to open (the fix is upstream, not in this repo)
+```
+
+Because no cure PR exists, the band-aid is never auto-retired and **`reconcile` escalates it at TTL
+expiry**. That is deliberate: someone still has to ship the upgrade.
+
+Three things about OSV worth knowing, each found by querying it:
+
+- Asking for a **CVE id often returns the git-range record** — no package, and `fixed` values that
+  are commit SHAs. The installable version lives on the GHSA/PYSEC alias, so the client follows
+  aliases. Without that, `CVE-2024-23334` recommends "upgrade to 24a6d649…".
+- When there genuinely is no released fix, it says so rather than offering a commit.
+- `summary` is often empty and OS-level CVEs have no package at all; the prose in `details` is the
+  real payload, and the CPE is the fallback identity.
+
+Set `VPCOPILOT_ADVISORY_CACHE=<dir>` to cache advisories on disk so a demo does not depend on the
+network.
+
+### Scan an OpenAPI spec (H3)
+
+A4 goes one way: you hand XC a schema and it enforces it. This is the other direction — read the
+spec and find the flaws **in** it. A spec is a security artifact whether or not anyone treats it as
+one, and it is often the only thing you have for a service you do not own.
+
+```sh
+vpcopilot scan --spec ./openapi.yaml --out out              # the contract alone
+vpcopilot scan ./app --spec ./openapi.yaml --out out        # …and the code, plus the drift between them
+```
+
+`--spec` is **additive**: alone it scans the contract; alongside a repo it also compares the two.
+(`--cve` is the exception — an advisory scan cannot be combined with either.)
+
+**Split by what needs judgement.** A deterministic pass finds what the document leaves unstated —
+a number with no `minimum`, a string with no `maxLength`, an operation with no `security`, an object
+with `additionalProperties` open. Those are facts, so recall does not depend on which model is
+configured. The agent then decides which of them *matter*: an unbounded `page` is nothing, an
+unbounded `amount` on a transfer is a business-logic hole.
+
+**Spec/code drift is a finding in both directions**, reported as `undocumented_or_orphaned`:
+
+- **declared but unserved** — dead documentation, or a shadow API removed from one place and not
+  the other
+- **served but undeclared** — the one that bites: applying an `api_schema` band-aid built from this
+  spec would start rejecting those routes
+
+That finding is a comparison of two documents, so it skips the verify agent entirely — asking an
+adversarial code reviewer to confirm a vulnerability in source it cannot see got it refuted at 0.10
+confidence.
+
+### Scan a dependency manifest (H2)
+
+`--cve` answers "can a load balancer hold the line on *this* advisory". `--manifest` asks it of
+every dependency you actually have — which is the form the question normally arrives in. Nobody
+hands you a CVE id; they hand you a `requirements.txt`.
+
+```sh
+vpcopilot deps ./requirements.txt                                   # what a scan WOULD find — no model calls
+vpcopilot scan --manifest ./requirements.txt --out out              # the dependency tree alone
+vpcopilot scan ./app --manifest ./package-lock.json --out out       # …and the code, correlated together
+vpcopilot scan --manifest ./requirements.txt --manifest ./pom.xml --out out    # repeatable
+```
+
+`--manifest` is **additive**, like `--spec`. Alone it resolves the dependency tree; alongside a repo
+the code findings and the dependency findings correlate together, so one band-aid can cover both.
+Formats: `requirements.txt`, `package-lock.json` (v1/v2/v3), `pom.xml`.
+
+**Start with `vpcopilot deps`.** It parses the manifests, asks OSV which pinned packages have
+advisories, and prints the whole funnel — with no model, no credentials and no tenant. It is the
+cheap way to see what a scan would cost and to tune the two knobs below before paying for one.
+
+**Two things it will not do, and both are the point:**
+
+- **It never guesses a version.** `flask>=2.0`, a bare `cryptography`, `-e .`, a `${spring.version}`
+  with no `<properties>` entry, a version inherited from a parent POM — each is listed under
+  `unpinned` with a reason, and never sent to OSV. This matters more than it sounds: OSV does *not*
+  error on a version string it cannot parse. Measured live, `aiohttp` at `not-a-version`,
+  `1.0.0-SNAPSHOT` and `${project.version}` each returned **81 advisories**, against 70 for the real
+  `3.9.1`. A guess does not fail loudly — it returns a bigger, wrong answer.
+- **It never hides what it skipped.** *"We did not check this"* and *"this is clean"* must not read
+  the same way, so every unpinned entry and every advisory held back by the filters is in
+  `dependencies.json`, on the console preview and in the HTML report, carrying its reason. The same
+  goes for what it could not check *despite trying*: a package OSV flagged and then failed to
+  answer for (a 429, a timeout) is listed under `unchecked` — its advisories are unknown, not
+  absent — and a manifest it could not read at all is an error on every surface, never an empty
+  table. A `package.json` is refused outright rather than half-read: it names version *ranges*, so
+  there are no installed versions to check; point at `package-lock.json`.
+
+**Bounding the agent stage.** Listing is cheap; resolving is not. `aiohttp` pinned at `3.9.1` alone
+returns 70 OSV records, and a modest manifest reaches several hundred advisories. So the *listing*
+is always complete and only the *resolve agent* is bounded:
+
+| flag | default | what it does |
+|---|---|---|
+| `--min-severity` | `high` | floor for reaching the agent. Below it: listed, not resolved. |
+| `--max-advisories` | `25` | cap on the agent stage (`0` = no cap). |
+| `--include-dev` | off | also resolve dev/test-scoped deps. A build-time package is not in the request path. |
+
+The cap is **shared out across packages**, not consumed in sort order — every vulnerable package
+gives up its worst advisory before any package gives up its second. On the fixture manifests a flat
+ordering gave `aiohttp` 23 of 25 slots because it sorts first and carries 35 advisories; sharing the
+budget covers 7 packages instead of 3 for the same cost.
+
+**The fixed version is code's, never a model's** — as in H1, and with one addition H2 needs. The
+recommendation is the smallest published fix **strictly greater than the version you have, for the
+package you have**. An advisory that names several packages fixes each at its own version (Log4Shell
+fixes `log4j-core` at 2.15.0 and `pax-logging-log4j2` at 1.10.8), and one package's fix is not
+installable for another. Where nothing published is newer, `dependencies.json` says so rather than
+naming the closest number.
+
+**Declining is still the load-bearing behaviour.** Most dependency advisories are not observable in
+an HTTP request, and those route to `no_bandaid` in code with the residual risk stated and the
+upgrade named. On the fixture manifests a typical run resolves 6 advisories to 2 exploitable and 4
+declined. A tool that invented a plausible path for all 6 would be worse than no tool.
+
+**No cure PR, and the counts say so.** As with `--cve`, the cure is a version bump in someone
+else's package, so `remediate` is never called and `pr` declines with the upgrade recommendation.
+Because no PR is drafted and none *can* be, an upgrade is never counted as one: `summary.json` and
+`run.json` carry `code_fix_prs` and `dependency_upgrades` separately, and the report shows
+"upgrades to ship (no PR)" beside the PR count rather than folding them together. Someone still has
+to ship it — `reconcile` (§6) holds the band-aid and escalates at TTL.
+
 ## 4. Apply a band-aid (mutates XC — gated + reversible)
 ```sh
 vpcopilot apply --from-scan out/policies/<artifact>.json --lb <lb> --url <host> --dry-run   # preview
@@ -89,6 +237,27 @@ normal flow; refusing would break every second apply. It is said out loud and wr
 In the console the same check runs inside the Mitigate job, so its warnings appear in the live log.
 A refusal renders an **apply anyway** button, and `no_change` renders as its own outcome rather
 than a pass or a fail.
+
+### Pre-apply blast-radius gate (G2)
+
+If a simulation (§ *Blast radius*) found the policy would block too much of the recorded traffic,
+applying it needs an explicit override:
+
+```sh
+vpcopilot apply --from-scan out/policies/<artifact>.json --lb <lb> --url <host> --allow-overbroad
+```
+
+Without it the apply refuses and names the rate and threshold; with it the apply proceeds and writes
+a `simulate_override` audit record carrying the finding, the policy, the LB, the rate, the threshold
+and the actor. Silent when nothing was simulated — G2 adds a check, never a prerequisite, so an
+operator who never runs `simulate` sees exactly the behaviour they saw before it existed.
+
+**This gate used to exist on only one surface**, and that is worth stating because it changes CLI
+behaviour. `simulate.promotion_block` had a single production caller — the console — so
+`vpcopilot apply --from-scan` would happily attach an over-broad policy the console refused, and the
+`--allow-overbroad` flag this documentation described did not exist. The check now lives in
+`simulate.promotion_gate`, called by both apply paths, so the CLI, the console and the MCP server
+share one copy and cannot drift. A guard in one surface is not a guard.
 
 ## 5. Open the code-fix PR (the cure)
 ```sh
@@ -196,6 +365,36 @@ nothing here touches XC or GitHub.
 Dry runs are not in it: nothing changed, so nothing is logged. The bundle is evidence for a human
 reviewer, not a compliance certification. Full reference: **[AUDIT.md](AUDIT.md)**.
 
+### Shipping the trail off the box (J3)
+
+The log is written by the machine that made the change, which is the one machine someone who made
+an unauthorised change would want to edit. Point `VPCOPILOT_AUDIT_SINK` at a collector and each
+entry is copied there as it is written:
+
+```sh
+VPCOPILOT_AUDIT_SINK=https://collector.example.com/ingest   # POST the entry as the body
+VPCOPILOT_AUDIT_SINK=syslog://10.0.0.9:514                  # …or syslog:///var/run/syslog
+VPCOPILOT_AUDIT_SINK=stdout                                 # …or a JSON line for a log-scraping runtime
+VPCOPILOT_AUDIT_SINK=off                                    # deliberately disabled
+vpcopilot audit-sink --send                                 # prove it lands (exits non-zero if it does not)
+```
+
+Both keys are on the console's ⚙ **Setup** page, which has the same readout and a **Send test
+event** button. `off` is a value rather than a blank field because the `.env` writer drops empty
+updates — a sink switched on from that page has to be switchable off from it.
+
+**The local `audit.log` stays authoritative.** The line is written to disk first and the sink gets
+the same string, so the two cannot disagree; if the local write fails, nothing is delivered.
+Delivery is fail-soft and can never change the outcome of the action being recorded — a dead
+collector costs one warning on stderr and one timeout, then goes quiet for a minute rather than
+stalling every subsequent entry. A sink that is *misconfigured* reports as unusable with the
+reason, because "we are shipping nothing" must never read the same as "nothing is configured".
+
+What a sink does **not** do is make the log tamper-evident. A delivered copy raises the cost of
+editing the local file afterwards; a missing one proves nothing, because the transport is allowed
+to fail. See **[AUDIT.md §10](AUDIT.md)** for what the collector receives, the measured syslog size
+limit, and what the sink attests.
+
 **Signing a bundle (optional).** Point `VPCOPILOT_MINISIGN_KEY` at an *unencrypted* minisign secret
 key and every export gains `manifest.json.minisig` beside the manifest:
 
@@ -259,7 +458,7 @@ header carries a live model switcher, and each step is deep-linkable (`#mitigate
 
 | Step | What |
 |---|---|
-| **① Scan** | point at a repo and run the pipeline — read-only, no XC/GitHub writes. Auto-advances to Review when it finishes |
+| **① Scan** | point at a repo — or a CVE, an OpenAPI spec, or dependency manifests — and run the pipeline. Read-only, no XC/GitHub writes. **Preview (no model calls)** shows the H2 dependency funnel before you spend anything. Auto-advances to Review when it finishes |
 | **② Review** | verified findings + the recommended band-aid; click a row for exploit / code / generated policy. **Open HTML report ↗** + **Download** |
 | **③ Simulate** | replay a recorded sample against each candidate through a **spare** LB and report what it would block; over-threshold policies warn at the gate |
 | **④ Mitigate** | apply each band-aid (or **Mitigate ALL**, one at a time, continuing past failures) and watch `before → after` stream, with a *self-healed in N attempts* badge |
@@ -267,6 +466,263 @@ header carries a live model switcher, and each step is deep-linkable (`#mitigate
 | **⑥ Retire** | the four-state ledger track, plus the **Audit trail** table and **Export evidence bundle (.zip)** / **All runs** |
 | **⑦ Benchmark** | build a model-tagged report from this run, then compare models side by side per target app |
 | **⚙ Setup** | credentials (writes `.env`), XC status, the per-agent model wiring, and the report buttons |
+
+## 7b. The BIG-IP lab (L2)
+
+The appliance the declarative WAF policy is validated against — a real BIG-IP with Advanced WAF, so
+"the emitted policy blocks the exploit" is something you watch rather than assert.
+
+```sh
+vpcopilot bigip-lab status
+vpcopilot bigip-lab create --origin 10.30.10.22:8080 --virtual-address 10.30.10.190
+vpcopilot bigip-lab rm --tenant vpcopilot_lab
+```
+
+Configure it with `BIGIP_URL`, `BIGIP_USER` and `BIGIP_PASSWORD` (all three are on the ⚙ Setup page).
+It builds an HTTP virtual server in front of one origin and is deliberately **clean-slate** — no WAF
+policy is attached, because the point of the lab is to watch the copilot attach one and watch the
+exploit stop working. A lab that arrived with a policy already on it would be the "looks applied and
+is not" confusion this project keeps finding, one layer earlier.
+
+**Reachability is yours to arrange, deliberately.** `BIGIP_URL` is just a URL; nothing here knows or
+cares how it resolves. In the reference lab the management interface is *not* published to the
+internet — it is reached through an SSM port-forward from the origin host, and `BIGIP_URL` points at
+the near end of that tunnel:
+
+```sh
+aws ssm start-session --target <origin-instance-id> \
+  --document-name AWS-StartPortForwardingSessionToRemoteHost \
+  --parameters '{"host":["10.30.10.190"],"portNumber":["8443"],"localPortNumber":["18443"]}'
+export BIGIP_URL=https://127.0.0.1:18443
+```
+
+Baking the tunnel into the tool would tie it to one topology and tempt someone into opening a
+management port to the internet instead.
+
+**The guard is the AS3 tenant.** An AS3 tenant is a hard partition — objects live under `/<tenant>/`
+and a tenant-scoped `DELETE` cannot reach outside it — so it is the BIG-IP analogue of an XC
+namespace, and `VPCOPILOT_PROTECTED_BIGIP_TENANTS` is the analogue of `VPCOPILOT_PROTECTED_LBS`:
+
+| | |
+|---|---|
+| `/Common` | refused **unconditionally** — it holds the appliance's own configuration. Not overridable, not even on a dry run: previewing its deletion is previewing an outage |
+| a tenant in `$VPCOPILOT_PROTECTED_BIGIP_TENANTS` | refused unless `--allow-protected-tenant` |
+| a name that is not a plain identifier | refused — `Common ` with a trailing space, `../Common`, or anything carrying `/` never reaches the appliance. A `/Common` check is only worth as much as the parsing in front of it |
+
+Matching is case-insensitive, because BIG-IP resolves `common` and `Common` to the same object.
+
+**Two things `lab-create` does not do, and this does.** It has an explicit inverse (`rm`), so a lab
+can actually be taken down; and every mutation writes an audit record (`bigip_lab_create` /
+`bigip_lab_remove`, category `lab`), so the trail shows it. `--dry-run` uses AS3's own
+`action: dry-run`, so the *appliance* reports what it would change — and, changing nothing, it
+writes no audit record.
+
+**A failed deployment is never reported as success.** AS3 signals failure two different ways and
+only one is an HTTP error: a schema rejection answers `HTTP 422` with a top-level `{code, errors}`
+and **no `results` array**, while a per-tenant failure answers `HTTP 200` with the bad code inside
+`results[].code`. Both raise, so a lab that deployed nothing cannot report `success` — or write an
+audit record claiming it worked.
+
+**"We declined" and "we could not reach it" are different answers**, and the exit code says which,
+because a script has to respond oppositely to them — fix the request, or retry:
+
+| exit | means | e.g. |
+|---|---|---|
+| `0` | it worked | |
+| `1` | the appliance, or the path to it | a dropped tunnel, an unreachable box, missing `BIGIP_PASSWORD`, an AS3 rejection |
+| `2` | usage | an unknown action, a missing `--origin` |
+| `3` | **the tool declined on policy** | `/Common`, a protected tenant, a malformed tenant name or origin |
+
+`status` draws the same distinctions rather than flattening them: an appliance that answers but has
+**no AS3 installed** (a `404` — the state every PAYG image ships in) is reported as exactly that,
+not as "unreachable", because the fix is a package install and not a network problem. A `401` names
+the credentials. And when the tenant list could not be fetched it renders `unknown`, never `(none)`
+— "we could not ask" must not read as "there are none".
+
+## 7c. One finding, every enforcement point (L1)
+
+`generate` produces an F5 Distributed Cloud config object. `emit` produces the **same finding** as a
+**declarative WAF policy**, which BIG-IP Advanced WAF and F5 WAF for NGINX (App Protect) both
+consume — so a finding covers the XC control it already generates *and* the enforcement points a
+customer already owns.
+
+```sh
+vpcopilot emit --out out --target bigip-awaf
+vpcopilot emit --out out --target nginx-app-protect --finding neg-pay-001
+```
+
+Also on ② Review in the console (`POST /api/emit`). It is read-only: it produces a document and
+touches no tenant and no appliance.
+
+### The emitted rule is sometimes better than the one we started from
+
+That is the story, not "we can also emit for BIG-IP". XC expresses the negative-amount finding as
+
+```json
+"body_matcher": {"regex_values": ["amount[^0-9-]*-[0-9]"]}
+```
+
+— a regex approximating *"a minus sign near the word amount"*. The declarative WAF policy expresses
+the constraint itself:
+
+```json
+{"name": "amount_cents", "dataType": "integer", "checkMinValue": true, "minimumValue": 0}
+```
+
+**And that constraint is derived by code, not by a model.** The two recorded probe requests are the
+evidence: the exploit sends `amount_cents: -50000`, the legit request sends `2500`, so the field, its
+type and the bound between them are facts. A number an operator acts on should not come from a
+prompt. Where the evidence does not establish exactly one such field — two candidates, none negative,
+nothing recorded — it **declines with a reason** rather than guessing, because a policy built on the
+wrong parameter blocks nothing and looks applied.
+
+### Controls with no declarative equivalent say so
+
+`rate_limit`, `malicious_user` and `bot_defense` report `unsupported` with a **named reason** and emit
+nothing — a rate is a property of the request *stream*, per-user risk scoring is stateful across many
+requests, and bot detection needs client interrogation that lives in a different product. `waf` and
+`waf_data_guard` decline too, for an honest reason: they *have* a declarative equivalent, but this
+emitter implements the value-constraint form only. Emitting a document that is shaped right and
+enforces nothing would be the exact failure this project exists to prevent.
+
+### Six traps, and only two of them are visible to a schema
+
+Each would ship a policy that blocks nothing — the G2 canary's failure mode, one layer down.
+
+1. **`dataType: "integer"` does not reject `-500`.** F5 defines integer as whole numbers only, so
+   `-500` *is* an integer. The sign rejection comes entirely from `minimumValue`.
+2. **A constraint only ALARMS unless its violation is armed** — `VIOL_PARAMETER_NUMERIC_VALUE` needs
+   `block: true`.
+3. **`parameterLocation` has no `json` value.** A JSON body value becomes addressable only through a
+   `json-profile` with `handleJsonValuesAsParameters: true`, attached via `urls[].urlContentProfiles`.
+4. **The URL's protocol is part of its identity.** An `https` entry does not match `http` traffic, so
+   a hardcoded protocol yields a policy that imports cleanly and matches nothing. `--protocol` must
+   match the virtual server.
+5. **ASM refuses a URL whose content-profile list omits the default `*:*` entry** —
+   *"[fatal] Could not add the URL … The default URL Content Profile (*:*) is mandatory."* Neither
+   schema requires it; only a real import says so.
+6. **The schemas cannot catch most of the above.** `additionalProperties` is absent from all **127**
+   NAP and **173** BIG-IP object nodes, and `blocking-settings.violations[].name` is a **free
+   string** in both — so an invented section, a misspelled key or a typo in the violation that arms
+   the block all validate **green**.
+
+Schema validation is therefore a necessary check and a weak one. What it genuinely establishes is the
+**portability swap**: NAP constrains `template.name` to `enum: ["POLICY_TEMPLATE_NGINX_BASE"]` while
+BIG-IP leaves it a free string, so a policy carrying the BIG-IP name *fails* NAP until swapped. The
+emitter uses the BIG-IP name deliberately — had it defaulted to the NGINX one, both schemas would
+pass and the check would prove nothing. The tests assert the pre-swap **failure** as well as the
+post-swap pass.
+
+The proof that a policy actually *blocks* is the appliance, which is what the L2 lab is for.
+
+### Proving it on the lab appliance
+
+The same two-request proof `apply.py` makes against XC, pointed at a BIG-IP — `probe.probe_from_spec`
+is target-agnostic, so nothing new was needed:
+
+```sh
+vpcopilot bigip-lab status                      # AS3 reachable? (see §7b for the tunnel)
+vpcopilot emit --out out --target bigip-awaf    # → out/emitted/bigip-awaf.<policy>.json
+```
+
+Attach it with an AS3 declaration whose `WAF_Policy` carries the document, then fire the finding's
+recorded probe at the virtual server. Note **`WAF_Policy.policy` is an `F5string` — a *reference*,
+not an inline object** — so the policy travels base64-encoded:
+
+```json
+"vpcopilot_waf": {"class": "WAF_Policy", "policy": {"base64": "<the policy JSON>"}, "ignoreChanges": true}
+```
+
+**Read the balance, not the status code.** BIG-IP's blocking page returns **HTTP 200** with a support
+ID, so a naive status check reads a block as a pass. `probe.blocked_by_edge()` — added in I1 for XC —
+is what tells the two apart, and it works unchanged against an appliance it was never written for.
+
+## 8. MCP server mode (K1)
+
+The same pipeline as MCP tools over stdio, so an agent session gets a band-aid proposal inline
+instead of shelling out. No extra install — the transport is stdlib.
+
+```sh
+vpcopilot mcp                    # read-only (default)
+vpcopilot mcp --write            # also expose apply, pr, retire, reconcile, simulate
+```
+
+Register it with any MCP client. For Claude Code:
+
+```sh
+claude mcp add vpcopilot -- /path/to/.venv/bin/python -m vpcopilot.cli mcp
+```
+
+**Read-only by default, and the write tools are *absent* rather than present-and-refusing.** A tool
+an agent can see is a tool it will try, so enabling them is an explicit act: `--write`, or
+`VPCOPILOT_MCP_WRITE=1`. Authoring the client config that does it is the human action, exercised
+once — the same argument `reconcile --apply` makes about the crontab.
+
+| Tool | What it does | Costs |
+|---|---|---|
+| `scan_result` | the band-aid proposal from a finished run: findings, triage, generated policies, cures, dependency funnel | nothing |
+| `patches_list` | live band-aids with age, TTL remaining, cure state, escalations | nothing |
+| `ledger` · `impact` | the four-state lifecycle; the headline numbers | nothing |
+| `deps` | what a `--manifest` scan would find, without a model call | reaches OSV.dev |
+| `simulation_result` | a previous blast-radius replay's numbers | nothing |
+| `drift` | live LB vs last snapshot vs proposed, read-only | XC credentials |
+| `verify_bundle` | re-check an evidence bundle against its own manifest | nothing |
+| `scan_start` · `scan_status` | start a scan, then poll it | **model calls**, minutes |
+| `apply` · `pr` · `retire` · `reconcile` · `simulate` | *only with writes enabled* | mutates |
+
+**Three things are deliberate.**
+
+*`apply`, `pr` and `retire` default to `dry_run=true`* — the opposite of every module function, whose
+default is a real run. The CLI and console each pass a choice a human made at a keyboard; an MCP call
+is issued by a model, so the default has to be the one that changes nothing, and applying for real
+has to be a second explicit call. `reconcile` is report-only unless `apply=true`, as on the CLI.
+
+*`simulate` is a write tool, though the roadmap listed it as read-only.* A simulation creates a
+throwaway policy object, attaches it to the load balancer, replays through it and deletes it again.
+Cleaning up after itself makes it safe, not read-only. `simulation_result` is the ungated way to read
+the numbers.
+
+*`apply` takes a policy **name**, not a path*, and derives the artifact from the run directory — an
+interface that accepts a caller-supplied filesystem path is an arbitrary-file reader, and a tool a
+model invokes is a worse place for one than an endpoint a human drives (the J2 precedent). The name
+must be a generated slug; anything carrying a path separator is refused.
+
+**What the opt-in does not do is supply the human.** MCP clients are expected to confirm tool calls
+with a user, but that is the client's behaviour, not something this server can enforce or verify —
+which is exactly why the write tools are off by default. What the server *can* guarantee is that a
+write tool calls the same module function the CLI and console call, so it inherits `guard_lb` for a
+protected load balancer, `PROTECTED_POLICIES` for a protected name, `drift.preflight` for drift and a
+self-shadowing DENY, the G2 blast-radius gate, rollback-unless-`keep`, and an audit record whose
+identity is stamped centrally. Reconcile passes `trigger="mcp"`, so the trail says an agent session
+did it.
+
+`force_probe` is deliberately not exposed at all: its guard requires a single `--finding` because
+replaying every destructive exploit at once is not something to do by accident, and a model deciding
+to pass it is exactly that accident.
+
+**stdout carries the protocol and nothing else.** The server points `sys.stdout` at stderr for its
+lifetime and writes frames to a private handle, so a stray `print` anywhere beneath it — the pipeline
+defaults `log=print`, and `rprint` is used throughout the CLI — lands on stderr, which the MCP spec
+reserves for logging, instead of corrupting the message stream.
+
+## 9. Pull-request review in CI (K2)
+
+Scan the diff on a pull request and comment the proposed band-aid on it, so a developer sees the
+virtual patch in the review where they introduced the hole.
+
+```sh
+vpcopilot ci-review --repo src/api --base origin/main            # prints the comment
+vpcopilot ci-review --repo src/api --base origin/main --post --pr-repo owner/name --pr 42
+```
+
+Ships as a composite action (`.github/actions/vpcopilot-scan/`) with an example workflow. Scans only
+what the branch changed, against the merge base; posts nothing when there is nothing above the
+threshold; and **never touches an XC tenant** — `ci.py` imports no tenant client at all, so a CI job
+needs a GitHub token and nothing else. The blast-radius number cannot be produced in CI (measuring it
+means attaching a policy to a load balancer), so the comment reports it only from a real tenant run's
+`simulation.json` and otherwise says plainly that no measurement was made.
+
+Full reference: **[CI.md](CI.md)**.
 
 **Run settings** — the collapsible bar shown on the action steps (**Mitigate / Cure / Retire**):
 LB · validate URL · PR repo · base · path prefix, plus **dry-run** (on by default), **refine** +

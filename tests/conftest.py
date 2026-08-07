@@ -114,6 +114,37 @@ class FakeHarness:
         pass  # no registry to warm for the fake
 
 
+# The live suite's fixtures. Re-exported here because pytest only auto-discovers fixtures from a
+# conftest — a fixture defined in an ordinary module is invisible, which is how the first live run
+# failed with "fixture 'evidence' not found" despite the helper being imported.
+from tests.live import evidence  # noqa: E402,F401
+
+
+@pytest.hookimpl(tryfirst=True, hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    """Stash each phase's report on the item so a fixture teardown can tell a test that RAN from one
+    that skipped. Without it the `evidence` vacuity check fired on skipped live tests and turned a
+    clean skip into an ERROR — the exact outcome the live suite is required not to produce."""
+    outcome = yield
+    setattr(item, f"_vpc_rep_{outcome.get_result().when}", outcome.get_result())
+
+
+@pytest.fixture(autouse=True)
+def _no_audit_sink(monkeypatch):
+    """J3: the audit sink is configured by environment, and `audit.record` runs in most of this
+    suite. A developer or CI box with `VPCOPILOT_AUDIT_SINK` exported would therefore ship the
+    suite's ~270 *fabricated* audit records — apply_waf, retire, rollback_failed — to a real
+    collector, where they are indistinguishable from records of real changes to a load balancer.
+    Measured at 267 datagrams on one full run.
+
+    Documenting "unset it before running the tests" would be a guard that depends on someone
+    remembering. This is the structural version, and it also keeps the "no network in tests"
+    invariant true regardless of the shell the suite is launched from. Tests that exercise the sink
+    set the variable themselves; a test-level `monkeypatch.setenv` runs after this and wins."""
+    for var in ("VPCOPILOT_AUDIT_SINK", "VPCOPILOT_AUDIT_SINK_TOKEN"):
+        monkeypatch.delenv(var, raising=False)
+
+
 @pytest.fixture
 def fake_xc():
     return FakeXC()
@@ -122,3 +153,24 @@ def fake_xc():
 @pytest.fixture
 def noop_sleep():
     return lambda *_a, **_k: None
+
+
+@pytest.fixture(autouse=True)
+def _reset_console_scan_state():
+    """The console's `_scan` dict is MODULE state shared by every test that posts to /api/scan.
+
+    `POST /api/scan` now claims `state="running"` synchronously, under a lock, before spawning the
+    worker — that is what closed the double-scan race. The consequence is that any test which stubs
+    `_run_scan` (several do, to avoid running a real pipeline) leaves the flag set, so the next such
+    test gets a 409 and fails for a reason that has nothing to do with it. Four tests across four
+    files broke exactly this way, every one of them passing in isolation.
+
+    Resetting it here fixes the class rather than the four instances, and keeps the guarantee that a
+    test's outcome does not depend on what ran before it.
+    """
+    yield
+    try:
+        from vpcopilot.console import app as _console
+        _console._scan.update(state="idle", log=[], summary=None, error=None)
+    except Exception:  # noqa: BLE001 — the console is optional for most of the suite
+        pass

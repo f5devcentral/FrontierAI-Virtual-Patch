@@ -282,65 +282,245 @@ Input today is a source repo. The vulnerabilities most customers lose sleep over
 dependencies they do not own, where the code cure is a version bump someone else has to
 ship. That is the case virtual patching exists for, and the pipeline cannot see it.
 
-- [ ] **H1** CVE and advisory input path. (M, P1)
-  Accept a CVE ID or GHSA identifier instead of a repo. An agent resolves the advisory into
-  an exploitation profile of affected paths, parameters, headers, and request shapes, and
-  that profile enters the existing triage and generate stages unchanged.
-  - Acceptance: a known path-traversal CVE in a web framework produces a `waf` or
-    `service_policy` band-aid; an advisory with no network-observable exploitation pattern
-    routes to `no_bandaid` with residual risk stated; `remediate` recommends the fixed
-    version rather than drafting a patch to vendor code; the ledger seeds `found` the same
-    way a repo finding does.
-  - Surfaces: `src/vpcopilot/inputs/cve.py`, a `resolve` agent in `agents/`,
-    `vpcopilot scan --cve CVE-YYYY-NNNNN`.
-  - **Advisory source (decided 2026-07-27): OSV.dev primary, GHSA for enrichment.** OSV needs no
-    auth, spans ecosystems on one schema, and returns affected ranges **and the fixed version** —
-    which is exactly what the acceptance needs for "recommend the fixed version rather than
-    drafting a patch to vendor code". It also keeps H1 runnable with no credentials, matching
-    `scan`'s "safe to run anywhere". GHSA (reusing the existing `GITHUB_TOKEN`) only for advisory
-    prose an agent reasons over; NVD is rejected — slow, rate-limited, imprecise version data.
-    Note what OSV does **not** give: the network-observable exploitation pattern (paths, params,
-    request shapes). Deriving that is the agent's job, and it is what makes the `no_bandaid`
-    branch of the acceptance meaningful.
-  - **Reconciled:** `src/vpcopilot/inputs/` does not exist — every module is flat under
-    `src/vpcopilot/` except `agents/` and `console/`. Creating a package is a new convention;
-    decide it deliberately or use `src/vpcopilot/input_cve.py`. A new `resolve` agent must also
-    be added to `config.AGENT_NAMES`, or it will be absent from `run.json` provenance, the
-    console's agent list, and the report's model chips. **The agent name is duplicated in three
-    places** — `config.AGENT_NAMES` (`config.py:16`, feeds `run.json` only), `AGENT_ROLES`
-    (`console/app.py:198`, drives `GET /api/agents`) and a hardcoded list in `report.py:251`
-    (drives the report's model chips) — all three need the same change.
-  - **Also touches an existing signature:** `scan`'s `repo` is a required positional
-    (`cli.py:36`) flowing into `run_pipeline(repo_path)` which does `Path(repo_path)`
-    (`pipeline.py:49-61`). `--cve` means making `repo` optional with mutual exclusion, an
-    alternate `run_pipeline` entry that does not walk a filesystem root, and the same optionality
-    on `ScanReq` / `POST /api/scan`. `RemediationPlan` (`schemas.py:122-131`) also *requires*
-    `file`, `diff` and `patched_content`, so "recommend the fixed version" needs either an
-    advisory-shaped remediation artifact or optional fields plus a `pr.py` branch that skips
-    `update_file`.
+- [x] **H1** CVE and advisory input path. (M, P1) — **DONE:** `vpcopilot scan --cve CVE-2024-23334`.
+  `inputs/osv.py` fetches the advisory, the new `resolve` agent derives its HTTP exploitation
+  profile (or declines), and the result enters triage and generate unchanged. Verified live against
+  api.osv.dev and a real model.
+  - **Acceptance, as met (all four checked live):** CVE-2024-23334 (aiohttp path traversal) →
+    **both** a `waf` and a `service_policy` band-aid; GHSA-8r6j-v8pm-fqw3 (fsevents supply-chain) →
+    `no_bandaid` with the residual risk naming why a load balancer cannot see it; the cure reads
+    `upgrade aiohttp to 3.9.2` with `patched_content` empty; the ledger seeds `found` with severity,
+    band-aids and `has_cure` exactly as a repo finding does.
+  - **What querying OSV for real changed.** Three behaviours are not visible from the schema and
+    each silently degrades the answer: (a) asking for a **CVE id usually returns the GIT-range
+    record** — no package, and `fixed` values that are commit SHAs; the installable `PyPI/aiohttp
+    3.9.2` only exists on the `GHSA-5h86-8mv2-jq9f` alias, so the client follows aliases (2 of 4
+    advisories tested needed the hop); (b) a commit SHA is never offered as an upgrade target —
+    "upgrade to 24a6d649…" is not a recommendation; (c) `summary` is frequently empty and OS-level
+    CVEs have no package at all, only a CPE, with the human versions hidden in
+    `database_specific.extracted_events`.
+  - **Declining is the load-bearing behaviour.** An agent that invents a plausible path for every
+    CVE would make this input path worse than useless — confident band-aids that block nothing
+    while a real vulnerability hides behind a green check. So `network_observable=false` is a
+    first-class answer with a required, min-length `reason`, the agent is forbidden from choosing a
+    control or guessing a version, and its paths are cleared in code if it declines and lists them
+    anyway. The `no_bandaid` routing is **deterministic**, not delegated to triage.
+  - **The fixed version is never model-generated.** `remediate` is not called on this path at all;
+    `inputs/cve.py` builds the `RemediationPlan` from OSV. Drafting a patch against vendor code is
+    structurally impossible rather than merely discouraged.
+  - **Decisions:** `inputs/` **is** a package (H1/H2/H3 are three siblings of one shape and share
+    the OSV client — the same criterion that justifies `agents/`), with a one-directional rule that
+    nothing under it imports `pipeline`. `VulnClass` is **not** widened — a CWE→class table covers
+    the common cases and `other` plus a concrete `exploit_sketch` is honest; widening ripples into
+    every agent prompt and golden. No sentinel in `file`.
+  - **Identity, not a fake path.** New optional `Finding.source` (`osv:CVE-…`) carries what `file`
+    carries for a code finding. Two real bugs it fixes: `coverage_key` returned the plausible-
+    looking `service_policy:` for every file-less finding, so all but the first were logged
+    "already covered" and got **no band-aid at all**; and the dedup key `("", class, "L0")` merged
+    distinct advisories of the same class. Both take a defaulted `identity` fallback, so the repo
+    path is structurally unreachable and byte-identical.
+  - **Registration is four places, not the three the roadmap said** — `config.AGENT_NAMES`,
+    `console.AGENT_ROLES`, `report.py`, and **`bench_model.AGENTS`**, plus a `resolve:` block in
+    all four `config/agents*.yaml` (an unlisted agent silently falls back to the default model and
+    `run.json` records that as fact).
+  - **Fixed en route (pre-existing `pr.py` bugs):** the no-patch check sat *above* the dry-run
+    branch, so `--dry-run` raised identically to a live run and could preview nothing; and an empty
+    `file` would have reached `repo.get_contents("")` as a directory listing rather than erroring.
+  - **Deliberate consequence:** an advisory finding has no cure PR, so `reconcile` holds its
+    band-aid and escalates at TTL. Someone still has to ship the upgrade — documented, not a
+    surprise.
 
-- [ ] **H2** Dependency manifest input. (M, P2) Depends on H1.
-  Parse `requirements.txt`, `package-lock.json`, and `pom.xml`, resolve advisories, and run
-  H1 per exploitable advisory.
-  - Acceptance: a manifest run lists affected packages, resolved advisories, and one
-    band-aid per exploitable advisory; correlation collapses overlapping band-aids the way
-    `B1` already does for repo findings.
-  - **Reconciled:** B1 cannot be inherited as-is. `correlate.coverage_key` (`correlate.py:19-23`)
-    keys request-scoped controls on `endpoint_of(file)`, which parses a *repo path*, and is called
-    with `f.file` (`pipeline.py:226`). An advisory finding has no repo file. `coverage_key` needs a
-    non-file identity (fall back to `Finding.endpoint` or the package coordinate) and
-    `pipeline.py:40`'s dedup key needs the same treatment.
+- [x] **H2** Dependency manifest input. (M, P2) — **DONE:** `vpcopilot scan --manifest <path>`
+  (repeatable, additive like `--spec`) and the read-only `vpcopilot deps <path>…`.
+  `inputs/manifest.py` parses `requirements.txt` / `package-lock.json` (v1/v2/v3) / `pom.xml`;
+  `inputs/deps.py` resolves them against OSV and hands H1's stages one candidate per
+  (advisory, package). `GET`+`POST /api/deps`, a manifest field and a **Preview (no model calls)**
+  button on ① Scan, a **Dependencies** panel in the HTML report, `dependencies.json` in the evidence
+  bundle. Verified live end to end against api.osv.dev and a real model. 81 tests.
+  - **Acceptance, as met:** a manifest run lists affected packages ✅ and resolved advisories ✅
+    (`dependencies.json`, complete regardless of what the agent stage reached) and produces one
+    band-aid per exploitable advisory ✅; correlation collapses overlapping band-aids ✅ — and does
+    it **across inputs**, which is the part that turned out to matter (see below).
+  - **The Reconciled note below was already satisfied before this item started.** H1 added the
+    `identity` fallback to `coverage_key` and the `f.file or f.source or f.id` dedup key, for the
+    same reason. Nothing in `correlate.py` or `_dedup_findings` needed changing. (Both line
+    citations had also drifted: the `coverage_key` call is `pipeline.py:352`, not `:226`.)
+  - **Batch was the wrong tool for the obvious job, and the right tool for a different one.**
+    `POST /v1/querybatch` returns advisory **ids only** — never the bodies. Fetching each id would
+    be one request per *advisory* (70 for `aiohttp 3.9.1` alone) where `/v1/query` returns every
+    full record for a coordinate in one round trip. So batch answers *which* packages are worth
+    asking about (400 coordinates in 3.4s, ids identical to `/v1/query`, nothing truncated) and the
+    bodies come from per-package queries for the hits: 16 requests for a 100-package manifest with
+    15 vulnerable, against 100. One invalid ecosystem also fails the **whole** batch with HTTP 400,
+    so entries are validated before sending and a failed batch degrades to per-package queries
+    rather than to "no advisories".
+  - **Four defects the live API found, three of them in code H1 already shipped:**
+    - **CVSS v4 is now the majority and was being read as `medium`.** `severity_from_cvss` matched
+      `CVSS:3.[01]` only. Live, `aiohttp 3.9.1` returns 43 v4 scores against 32 v3, and **38 of its
+      70 records publish a v4 vector and nothing else** — every one of which fell through to the
+      `medium` default whatever it said, including `AV:N/AC:L/AT:N/PR:N/UI:N/VC:N/VI:N/VA:H`, an
+      unauthenticated remote DoS. One CVE at a time that is a cosmetic mislabel; H2 *filters* on this
+      value, so it decided what got resolved at all. Fixed by mapping v4's `VC/VI/VA` onto the v3
+      names so **one** bucketing rule serves both and they cannot drift; `AT` defaults to `N`, so
+      every v3 verdict is byte-identical (pinned by the existing parametrized test, unchanged).
+    - **`upgrade_target` recommends another package's version.** It takes the first `affected` row
+      carrying a version, whatever package it names — which is right for H1's question ("what does
+      this advisory fix", shown beside the package) and wrong for H2's ("what should I install").
+      Reproduced live: a manifest pinning `org.ops4j.pax.logging:pax-logging-log4j2 1.10.0` is told
+      by Log4Shell to upgrade to **2.15.0**, which is `log4j-core`'s fix and not a version
+      pax-logging has ever published; its own is `1.10.8`. Same shape on `GHSA-p6mc-m468-83gw`,
+      where `lodash.pick` is affected with **no fix published at all** and would be sent to
+      `lodash`'s 4.17.19. `upgrade_target_for()` filters to the installed package and takes the
+      smallest published fix **strictly greater than the installed version**; `upgrade_target` is
+      untouched, so H1 is unaffected.
+    - **Which maintenance branch you are told about was decided by document order.** Selection
+      ignored the installed version entirely. Log4Shell publishes `2.13.0→2.15.0`, `2.0-beta9→2.3.1`
+      and `2.4→2.12.2` for one package; the live record happens to list the right one first, so
+      `2.14.1` got the correct answer **by luck**. Nothing in the OSV schema promises that order and
+      the failure it permits is recommending `2.3.1` to someone running `2.14.1` — a downgrade,
+      presented as the fix. Pinned by a test that reorders the blocks. This also needed a version
+      comparator: `packaging` is PEP 440 only and raises on Maven's `2.0-beta9`, and a string sort
+      puts `1.10.0` below `1.9.2`.
+    - **70 OSV records are 35 advisories.** OSV publishes a GHSA *and* a PYSEC entry for most Python
+      advisories, cross-linked by `aliases`. Collapsing them is correctness, not thrift — the
+      duplicate carries a different id, so nothing downstream would have recognised it as one, and
+      it would have cost two model calls and two band-aids per hole. `related` is deliberately not
+      followed: it links advisories that are *about* each other, not identical ones.
+  - **A defect only the live run could find, and the one worth reading.** The first end-to-end run
+    left **Log4Shell with no band-aid at all** while reporting it as covered. Triage recommended one
+    control for it — the LB-wide `waf` — which an aiohttp header-injection advisory had already
+    claimed, so the loop ended having generated nothing, and the WAF that actually shipped
+    (`waf-block-header-injection-nullbyte-crlf`) addressed nothing about JNDI. Two fixes, both
+    pinned: a finding whose *every* recommended band-aid was collapsed now falls through to its
+    non-recommended alternatives rather than ending bare (Log4Shell gets
+    `deny-log4j-jndi-lookup`), and an LB-wide correlation record now states that the attached policy
+    was generated and validated against the **owning** finding's exploit, not this one's. **This is
+    a deliberate behaviour change to a shared path** (B1 correlation, which repo scans use too): it
+    only widens — the alternatives are reached solely when the recommended tier produced nothing, so
+    a run where they succeed is byte-identical. Pinned in both directions.
+  - **The scale problem is the design.** A manifest is an unbounded input, so listing and resolving
+    are separated: `dependencies.json` carries every package parsed, every entry that could not be
+    pinned, and every advisory found, whatever the agent stage reached; only the agent stage is
+    bounded, by `--min-severity` (default `high`) and `--max-advisories` (default 25, `0` = off).
+    Everything held back is listed **with the reason it was held back** — "we did not check this"
+    and "this is clean" must never render the same way, in the CLI, the console, the report or the
+    bundle caveats.
+  - **The cap is shared across packages, not consumed in sort order.** The first live run made this
+    obvious: `aiohttp 3.9.1` alone carries 35 advisories and a flat `(severity, package, id)`
+    ordering handed it 23 of 25 slots, so every other package competed with one dependency's back
+    catalogue and anything later in the alphabet was capped out by advisories no worse than its own.
+    Dealt round-robin, the same 25 slots cover **7 vulnerable packages instead of 3**.
+  - **Refusing to pin a version is the load-bearing behaviour, and OSV is why.** A version string it
+    cannot parse does **not** error: `aiohttp` at `not-a-version`, `1.0.0-SNAPSHOT` and
+    `${project.version}` each returned **81 advisories** live, against 70 for the real `3.9.1` and
+    87 for no version at all. So an unresolved `${...}` or an unpinned `flask>=2.0` produces a
+    bigger, wrong answer that every downstream stage treats as fact. Every entry the parsers cannot
+    pin goes to `unpinned` with a machine-readable reason and is never sent.
+  - **`vpcopilot deps` is the read-only surface**, reaching the same verdict about *which*
+    advisories a scan would spend a model call on without spending one — no model, no credentials,
+    no tenant. Both it and `POST /api/deps` call `deps.survey_report`, so the preview and the scan
+    cannot disagree about scope.
+  - **The artifact is `dependencies.json`, deliberately NOT `manifest.json`.** `export.verify_bundle`
+    locates each run inside an archive by every member whose name ends `manifest.json`, so an
+    out-dir artifact by that name would be read as a second evidence manifest and break verification
+    of the bundle it ships in. Pinned by a test.
+  - **Found by adversarial review, before shipping** (28 raised across five failure dimensions, 2
+    refuted, 8 confirmed and fixed, plus 4 found while verifying the reviewers' claims). Every one
+    is the same shape — *something never actually checked rendering as clean* — which is the single
+    thing this input path exists to prevent:
+    - **The alternates fallback re-inflicted the exact bug it was written to fix, on a different
+      finding.** It ran interleaved with the recommended tier and generated **every** alternative,
+      so a non-recommended alternate could claim an LB-wide slot *before* a later finding that
+      actually recommended that control was reached. Reproduced: `loser`'s unrecommended
+      `rate_limit` took the slot, `brute` — which recommended `rate_limit` — got **no band-aid at
+      all** and was recorded as covered by a policy built from `loser`'s exploit, and `loser` got
+      three controls triage never recommended. This contradicted the "only widens / byte-identical"
+      guarantee stated below. Now a **deferred second pass**: every recommended claim is registered
+      first, and the fallback takes only the **first** alternative that generates. Verified live —
+      Log4Shell still gets `deny-jndi-log4shell-headers` after a *code* finding claims the WAF, and
+      `otp-brute-001` gets one alternative where it used to get three.
+    - **`code_fix_prs` counted dependency upgrades as drafted PRs.** A `--manifest` run reported
+      `code_fix_prs: 6` and the report's impact hero rendered "6 — code-fix PRs (the cure)" when
+      zero were drafted and none *can* be. Split on `kind`, the discriminator `pr.py` already
+      decides by; `dependency_upgrades` is its own count and hero stat. A repo scan is unchanged
+      (every remediation is `code_fix`). Pre-existing in H1 at N=1; H2 made it N-per-manifest.
+    - **A `package.json` parsed to zero packages, zero skipped and no error** — byte-identical to a
+      clean lockfile. `detect_kind` routes any JSON carrying `dependencies` to the npm parser, and
+      a package.json has one, but of name → *range string* where a v1 lock has name → `{version}`;
+      every entry failed the isinstance check and was dropped. It is now refused with an actionable
+      error, because a package.json has no installed versions to check at all.
+    - **`dependencies.json` was never cleared**, so a later scan of the same out dir *without* a
+      manifest republished the previous run's dependency data through the report, `GET /api/deps`
+      and the evidence bundle. It is the only conditionally-written member; the rest are always
+      rewritten. (G4 shipped this same class of bug with leftover `policies/` artifacts.)
+    - **One 429 during the batch fallback ended the whole scan** — including the repo half of a
+      `scan ./repo --manifest` run. The per-package retry loop was unguarded, so the fallback that
+      exists so a batch failure never loses a chunk became the thing that lost everything. Each
+      coordinate is now guarded and a failed one is reported **unchecked**, never clean.
+    - **A package whose advisory fetch failed rendered exactly like a clean one** — it stayed in
+      `vulnerable` but contributed no row, no counter and no warning. New `unchecked` list and
+      `packages_unchecked` counter, surfaced in `dependencies.json`, the CLI, the console and the
+      report.
+    - **The console preview dropped parse errors entirely**, so an unreadable manifest showed an
+      all-zero funnel and an empty table — indistinguishable from a clean one. The CLI had printed
+      them in red all along, so the guard lived on only one surface.
+    - **A cleared "Max advisories" box meant NO cap in the console** (`parseInt("")||0` → 0 → off)
+      where the CLI defaults to 25 — a two-surfaces divergence failing in the expensive direction.
+    - **npm workspace source trees were queried as registry packages.** v2/v3 `packages` keys are
+      paths; only `node_modules/…` are installs. First-party code was sent to OSV under a name that
+      can collide with a public package, and an entry with no `name` went under its directory path,
+      which is not a legal npm name — both counted as checked-and-clean.
+    - Plus: a v1 lock entry with no `version` vanished from both halves of the answer where the
+      v2/v3 branch refuses it explicitly; an unresolved `${...}` in a pom's **groupId/artifactId**
+      reached OSV inside the coordinate name (only the *version* was guarded); and a short `200`
+      from `querybatch` left the unanswered tail absent from the result, which the caller reads as
+      "no advisories".
+    - **Refuted, and worth recording:** `POST /api/deps` taking a caller-supplied path is *not* a
+      new arbitrary-file reader. The console already accepts caller paths in `POST /api/scan`
+      (`repo`, `spec`, `manifest`), `/api/apply` and `/api/apply-apischema`, binds `127.0.0.1`, and
+      ships no CORS middleware; the identical capability is the documented CLI contract. J2's
+      refusal of a caller-supplied path applied to a bundle **derivable from server state**, where
+      accepting one adds capability for zero function. A manifest has no server-state equivalent.
+  - **Decisions:** `--manifest` is **additive** (H3's precedent) rather than exclusive like `--cve`,
+    because a manifest lives in the repo you are already scanning and the cross-input correlation is
+    the point — verified live: Log4Shell's WAF slot was claimed by a *code* finding
+    (`sqli-login-001`) in a `repo+manifest` run. Dev/test-scoped dependencies are **listed but not
+    resolved** without `--include-dev`: a build-time package is not in the request path. One
+    candidate per (advisory, package) — two packages hit by one advisory are two upgrades to ship —
+    but the resolve agent runs once per *advisory*, so they cost one model call and cannot receive
+    two different verdicts.
+  - **Reconciled (superseded — see above):** B1 cannot be inherited as-is. `correlate.coverage_key`
+    (`correlate.py:19-23`) keys request-scoped controls on `endpoint_of(file)`, which parses a *repo
+    path*, and is called with `f.file` (`pipeline.py:226`). An advisory finding has no repo file.
+    `coverage_key` needs a non-file identity (fall back to `Finding.endpoint` or the package
+    coordinate) and `pipeline.py:40`'s dedup key needs the same treatment.
 
-- [ ] **H3** OpenAPI as a discovery input. (M, P2)
-  `A4` applies a schema the operator supplies. This is the other direction: read a spec and
-  find the flaws in it, including endpoints absent from the code and code paths absent from
-  the spec.
-  - Acceptance: a spec declaring `amount` with no lower bound gets reported as a finding and
-    routes to `api_schema`; endpoints in the spec with no code match report as
+- [x] **H3** OpenAPI as a discovery input. (M, P2) — **DONE:** `vpcopilot scan --spec <path>`,
+  alone or alongside a repo. `inputs/openapi.py` does a deterministic structural pass (unbounded
+  numbers/strings/arrays, operations with no `security`, `additionalProperties` left open, `$ref`
+  followed with a cycle bound) and the spec is then handed to the **existing `discover` agent** as
+  one more file — no fourth agent, so spec findings verify, triage and generate exactly like code
+  findings. Verified live end to end.
+  - **Acceptance, as met:** a spec declaring `amount` with no lower bound produced
+    `neg-amount-001` → `service_policy` + **`api_schema`**; spec/code drift is reported as
     `undocumented_or_orphaned`; findings flow into the same triage table.
-  - Surfaces: `src/vpcopilot/inputs/openapi.py`, `vpcopilot scan --spec <path>`.
-  - **Reconciled:** same `inputs/` package question as H1 — settle it there first. `--spec`
-    changes the same required `repo` positional H1 does; do both in one change.
+  - **Split by what needs judgement.** The structural pass is code, so recall does not depend on
+    which model is configured; the agent only decides which facts *matter* (an unbounded `page` is
+    nothing, an unbounded `amount` on a transfer is a hole). The orphan comparison is pure code —
+    it is a diff of two documents.
+  - **Two real bugs the first live run surfaced.** (a) A spec is ONE file declaring MANY endpoints,
+    so `endpoint_of("pay-api.yaml")` returned the same string for every finding and all six
+    collapsed onto one `service_policy` coverage key, with five logged "already covered" and given
+    no band-aid. Spec findings now carry `source` and leave `file` empty, and the coverage identity
+    prefers `endpoint` — three endpoints, three keys, and only the two genuinely on
+    `/api/v1/transfer` collapse. (b) The `undocumented_or_orphaned` finding was being sent through
+    `verify`, which reads the offending source; with no source to read it refuted the finding at
+    0.10 confidence. It is appended after verify instead — a comparison of two documents is not a
+    claim about code.
+  - **`--spec` is additive**, unlike `--cve`: alone it scans the contract, with a repo it also
+    reports the drift (which needs both). `run.json` records `input_kind` as
+    `repo` / `spec` / `repo+spec` / `advisory`.
+  - Fixture: `bench/fixtures/specs/pay-api.yaml`.
 
 ---
 
@@ -535,40 +715,365 @@ sees the trail. J1–J4 are the open `BACKLOG.md` evidence entries, scheduled; *
     `manifest.json` already SHA-256s every member and `docs/AUDIT.md` ships a runnable
     verification snippet. Signature checking is added when J1 lands.
 
-- [ ] **J3** Audit event sink. (M, P2)
-  An optional sink on `audit.record` sending each entry to syslog, an HTTP webhook, or
-  stdout JSON, putting the trail somewhere other than the box making the change.
-  - Acceptance: fail-soft, a dead collector never fails an apply and logs one warning;
-    configured in `.env` and the ⚙ Setup page; the local `audit.log` stays authoritative.
+- [x] **J3** Audit event sink. (M, P2) — **DONE:** `audit_sink.py`, hooked inside `audit.record`
+  itself, so all 30 call sites and all three surfaces inherit it with no call-site change.
+  `VPCOPILOT_AUDIT_SINK` picks the transport by scheme — `https://…` (POST), `syslog://host:514`
+  (RFC 3164 datagram), `syslog:///var/run/syslog` (unix datagram), `stdout`, or `off` — plus
+  `VPCOPILOT_AUDIT_SINK_TOKEN`. Both keys are on the ⚙ Setup page; `vpcopilot audit-sink [--send]`
+  and `GET`+`POST /api/audit-sink` are the check. No new dependency (httpx is already a base dep;
+  syslog is a raw socket). Verified live end to end. 68 tests; suite 785 → 854, coverage 79% → 80%.
+  - **Acceptance, as met:** a dead collector never fails an apply ✅ — verified live, a real
+    `audit-backfill` against a black-holed sink exited **0**, wrote its sidecar and its audit entry,
+    and emitted exactly **one** warning; configured in `.env` and the ⚙ Setup page ✅ — verified by
+    POSTing `/api/config` in a running console and watching it take effect with **no restart**; the
+    local `audit.log` stays authoritative ✅ — the line is serialized **once** and handed to both
+    destinations, so the shipped copy is byte-identical to the line on disk (verified live), and a
+    failed local write delivers nothing.
+  - **"Logs one warning" is a design constraint, not a log line.** A hung collector at a 5 s timeout
+    times the several entries one apply writes is a stall the criterion does not name but plainly
+    forbids. So a failure starts a 60 s cooldown: one timeout and one warning per outage, not per
+    entry. The warning goes to **stderr**, never stdout — `audit.record` takes no log callable and
+    adding one would land it in `**detail` and be serialized into the entry, and a warning that
+    relied on K1's stdout swap would corrupt the protocol stream anywhere the swap is not in force.
+  - **Refusing to guess, applied to a transport.** An unparseable sink value is reported `unusable`
+    with the reason on every surface — it is *not* silently equivalent to having no sink. That is the
+    H2 `unpinned`-vs-clean distinction, and it is the whole feature: a run succeeds either way, so
+    without it a misconfigured sink is invisible.
+  - **`off` is a value, not an empty box.** `console._write_env` drops falsy updates and the UI skips
+    empty inputs, so clearing the field cannot unset a key — without an explicit `off`, a sink
+    switched on from the Setup page could never be switched off from it.
+  - **The syslog size limit is asked of the kernel, never hardcoded — and it is not theoretical.**
+    Measured: a macOS `/var/run/syslog` unix socket has `SO_SNDBUF` **2048** and refuses more with
+    `EMSGSIZE`; UDP walls near 9216; a Linux `/dev/log` is far larger. A realistic `drift_detected`
+    carrying a 60-field diff measured **5,481 bytes** — 2.7× the macOS limit — so the entries that
+    overflow are exactly the ones worth shipping. The full entry is sent and *only* a kernel refusal
+    triggers a reduced envelope. Verified against a real kernel: a **16,139-byte** entry was refused
+    on UDP and a **363-byte** valid-JSON envelope arrived carrying the action, `finding_id`, the true
+    byte count and a pointer to the local log, while the on-disk entry kept all 120 changes. A
+    dropped record or a truncated fragment would both have read as nothing happening.
+  - **Decisions.** *Hooked inside `audit.record`*, the one chokepoint, so the MCP write tools inherit
+    it with no tool-list change (pinned by a test). *No new `record()` parameter of any kind* —
+    `**detail` swallows unknown kwargs and `json.dumps` has no `default=`, so a stray `log=` would be
+    serialized into the entry or raise after the LB was already mutated. *The sink never writes an
+    audit record of its own*: it lives inside `record`, so that would recurse, and an
+    entry-count-changing side effect is the bug J4's no-op check exists to prevent — delivery status
+    is reported by `audit-sink` and the Setup card instead. *The entry goes verbatim, with no
+    envelope and no `out_dir`* — a filesystem path is not something to put on the wire (the J1 leak
+    precedent) and `run_id` is already the join key. *One sink, not a list.* *Timeout hardcoded at
+    5 s*, matching the house style of literal timeouts, but shorter than `reconcile.notify`'s 10 s
+    because this one sits on the critical path of an apply rather than at the end of a pass.
+  - **Deliberately no MCP tool.** The sink itself is inherited by every MCP write tool, which is the
+    point; the *check* is operator configuration, and sending a test event to an external collector
+    on a model's initiative is what K1's opt-in exists to prevent.
+  - **Found by self-review before the reviewers reported, each pinned by a test.** Two were real
+    leaks or dead ends rather than style:
+    - **A password in the sink URL would have been printed on every surface.** `urlsplit` puts
+      userinfo in `netloc`, and the redactor was rebuilding the origin from `netloc` — so
+      `https://svc:hunter2@collector/x` rendered the password on the CLI panel, the Setup page and
+      the API response. Rebuilt from `hostname`/`port`, with userinfo collapsed to `…@`.
+    - **An IPv6 collector could never be reached.** The socket family was hardcoded `AF_INET`, so
+      `syslog://[fe80::1]:514` was configured and delivered nothing, for ever — the exact
+      "configured but silently dead" failure the item exists to surface. Resolved via `getaddrinfo`.
+    - **`check(send=True)` erased the evidence it was called to diagnose.** It called `reset_state()`
+      to escape the cooldown, wiping a long-lived console's record of earlier failures: an operator
+      clicking the button to investigate deleted the symptom. Replaced by an explicit `force` that
+      bypasses only the cooldown; a test event that lands also re-arms a suppressed sink.
+    - Plus: the one-warning latch was a check-then-set across the console's per-apply threads (now
+      check-and-set under a lock); the oversize envelope could itself overflow, since it borrows
+      unbounded strings from the entry (now bounded); and whitespace in a hostname could split the
+      syslog header so a receiver read part of it as the tag.
+  - **Found by adversarial review, before shipping** (35 raised across six failure dimensions; 4
+    confirmed after independent skeptics tried to refute each, and every one was the same shape the
+    item exists to prevent — *not delivering, rendering as delivering*):
+    - **The one input that produced silence was the one this module exists to make loud.**
+      `urlsplit` *raises* on some malformed values — a dropped bracket in an IPv6 host
+      (`https://[2001:db8::1/x`), a netloc failing NFKC validation — and unguarded that propagated
+      out of `status()` into a **CLI traceback and a console 500**, while `emit`'s catch-all
+      swallowed it with **no warning and no `last_error`**. Reproduced on all three surfaces. Made
+      reachable by this item's own IPv6 support, which is what invites that typo. Now returns the
+      ordinary invalid shape every surface already renders.
+    - **A 3xx counted as a successful delivery.** The client does not follow redirects, so the body
+      was never re-sent — a moved ingest path or a proxy bouncing to an SSO page would swallow the
+      entire audit stream while every surface read `delivered N/N`. Reproduced against a real 302
+      server: `sent`, `delivered 1`, exit 0, and the redirect target never contacted. **Refused
+      rather than followed**, deliberately: the request carries the bearer token, and chasing a
+      `Location` to an unconfigured host is how a credential travels.
+    - **`sent` over UDP meant "handed to the kernel".** A datagram to a port with nothing bound
+      succeeds at the send call, so `audit-sink --send` against a dead collector printed `sent` and
+      exited 0. Now `sent, unconfirmed` on both surfaces, saying what was established and what was
+      not — the J2 `present-unverified` precedent, where reporting "I cannot check this" as "this
+      worked" was the one thing that would destroy the distinction that matters.
+    - **The test suite shipped fabricated audit records to a real collector.** With
+      `VPCOPILOT_AUDIT_SINK` exported, one full run sent **267 datagrams** of invented
+      `apply_waf` / `retire` / `rollback_failed` entries — indistinguishable, at the collector, from
+      records of real changes to a load balancer. The doc had said "unset it before running the
+      suite", which is a guard that depends on remembering; `tests/conftest.py` now clears it in an
+      autouse fixture. Verified with a counter: 1 deliberate record registers, the full suite adds
+      **zero**.
+  - **Two pre-existing races in `runmeta`, found because J3's concurrency test reproduced them, and
+    both fixed here.** They are called out rather than slipped in — neither is caused by this change,
+    but the first is a raise inside `audit.record`, which no audit-integrity item should ship past:
+    - **`_save`'s temp file was named by PID only**, so two threads writing a fresh out dir shared it
+      and the loser of the `os.replace` got `FileNotFoundError` **out of `audit.record`** — a change
+      already made to a load balancer that could not be recorded. Reproduced **12 times out of 12**
+      with 8 threads and *no sink configured at all*. The console starts every apply on its own
+      daemon thread with no job lock. Now namespaced by pid **and** thread id.
+    - **`run_id` minting was an unguarded read-modify-write**, so those same eight concurrent first
+      writes produced **eight different run_ids** — seven audit entries carrying a join key
+      `run.json` does not contain, which is the export's whole attribution path. Now thread-atomic;
+      single-threaded behaviour is byte-identical, and the remaining cross-*process* case is stated
+      rather than pretended away.
+  - **Fixed en route (pre-existing console defect, found while validating the Setup card):**
+    `class="bad"` marks a failure in the H2 dependency preview — a manifest that would not parse, a
+    package OSV could not be asked about — and **`.bad` was defined nowhere in the CSS**, so all of it
+    rendered as ordinary body text. A warning styled like content is precisely the defect that
+    preview exists to prevent. Defined, which repairs the three pre-existing call sites as well as
+    J3's own; pinned by a test that fails if any failure-marking class is used but undefined.
+  - **What a sink does not do, stated rather than left to be discovered** (the J1/J4 precedent, and
+    `docs/AUDIT.md`'s honest-limits list is amended rather than left contradicting the feature): it
+    does **not** make the log tamper-evident. A delivered copy raises the cost of editing the local
+    file afterwards; a *missing* one proves nothing, because the transport is allowed to fail. It is
+    best-effort by construction, and where the two disagree they disagree about delivery.
+  - **Could not be confirmed on this box, and says so rather than claiming it:** that an entry
+    reaches a real syslog *daemon's* store. macOS discards `local0.info` by default — `/etc/asl.conf`
+    routes only auth facilities and `/etc/syslog.conf` forwards only `install.*` — and the control
+    proves it is the box, not the frame: `/usr/bin/logger -p local0.info` also produces zero hits.
+    What *was* verified is the wire format, against a strict RFC 3164 parser: `<134>` (local0.info),
+    space-padded day, hostname, `vpcopilot[pid]`, and a JSON payload that survives framing intact.
   - **Reconciled:** there is no Admin tab — credential and `.env` editing lives on the ⚙ Setup
-    page (`GET`/`POST /api/config`).
+    page (`GET`/`POST /api/config`), which renders `MANAGED_KEYS` generically, so the two new keys
+    needed no HTML change to appear.
 
-- [ ] **J4** Attribution backfill. (S, P2)
-  `vpcopilot audit-backfill` fills only what is provably derivable, policy name to finding
-  via `policies.json`, marks the rest `unknown`, and records the backfill itself.
-  - Acceptance: no entry gets an invented actor or run_id; the backfill writes its own audit
-    record; a second run is a no-op.
-  - **Reconciled:** `audit` is a flat `@app.command()` with no typer sub-app, so `audit backfill`
-    as two words is not addable as written — `audit-backfill` matches the existing kebab
-    convention (`bench-model`, `apply-maluser`, `xc-rm`, `lab-create`). Smaller than it looks:
-    `export.build_audit_events` **already** recovers a finding from the `policies.json` index for
-    legacy entries and already leaves blanks rather than inventing. J4 persists what the exporter
-    derives at read time. **It cannot rewrite `audit.log`**: the log is append-only
-    (`audit.py:26`) and `record()` strips caller-supplied identity (`_STAMPED`, `audit.py:17,21`),
-    enforced by `test_identity_cannot_be_overridden_by_a_caller`. The backfill must write a
-    sidecar (e.g. `<out>/audit-backfill.json`) that `export.build_audit_events` consults beside
-    its existing `by_policy` lookup. Note a second copy of that lookup already exists —
-    `ledger.find_finding_for_policy` (`ledger.py:108`) — consolidate on one rather than adding a
-    third. Needs a `POST /api/audit-backfill` twin per the two-surfaces invariant.
+- [x] **J4** Attribution backfill. (S, P2) — **DONE:** `vpcopilot audit-backfill` +
+  `POST /api/audit-backfill`. `backfill.py` freezes the finding each audit entry belongs to into
+  `<out>/audit-backfill.json`, which `export.build_audit_events` reads beside the log and the
+  evidence bundle ships. Verified against the two real audit logs on disk. 21 tests.
+  - **Acceptance, as met:** no entry gets an invented actor or run_id ✅ — guaranteed by having
+    nowhere to put one: the sidecar carries attribution and nothing else, pinned by a test on its
+    keys; the backfill writes its own audit record ✅ (`audit_backfill`, with identity stamped
+    centrally like every other action); a second run is a no-op ✅ — nothing written, nothing
+    recorded.
+  - **The reconciled note undersold why this matters, and running it on real data showed it.** It
+    framed J4 as persisting what the exporter already derives at read time. But `policies.json` is
+    rewritten by **every** scan, so the derivation does not merely decay — it can go *wrong*. Two
+    outcomes, and the second is the one worth building for:
+    - Re-scan into the same out dir and the mapping is gone; the exporter silently stops attributing
+      those entries.
+    - If the later scan generates a policy with the **same name** for a **different** finding, the
+      live lookup still succeeds and attributes the old entry to the **wrong** finding — a confident
+      wrong answer in the artifact whose entire job is to be trustworthy. That is why the frozen
+      answer **wins over** the live lookup rather than merely filling gaps in it.
+    Both reproduced against the real `out-claude` log, whose four `refine_apply` entries record a
+    policy but no finding: attribution survived a wiped index, and a planted name collision failed to
+    move them.
+  - **`unknown` is sticky, deliberately.** An entry the backfill looked at and could not resolve stays
+    unresolved, so a later `policies.json` cannot supply an answer the backfill already declined to
+    give. "We looked and could not establish this" and "we have not looked" are different facts —
+    the same distinction H2 draws between an unpinned dependency and a clean one.
+  - **The no-op is load-bearing, not tidiness.** The command appends its own `audit_backfill` entry,
+    so without the check every run would see one more entry than the last, decide something had
+    changed, and append again: a log that grows by a line every time anyone asks whether it needs
+    backfilling. (The I1 precedent — a reconcile pass that changes nothing writes nothing.)
+  - **Keyed by index, verified by `(ts, action)`.** The index is stable only because the log is
+    append-only; if it is ever rebuilt or truncated the index still resolves — to a *different*
+    entry. Mismatched rows are dropped and counted rather than moved onto the wrong record, and the
+    count is surfaced, because a non-zero one means the log was rewritten and that is itself worth
+    knowing.
+  - **Verified against the real logs, and the no-op case is the interesting one.** `demo/out` is
+    already fully attributed — every entry carries its `finding_id` — so the backfill resolved
+    nothing and wrote nothing, which is the correct answer and the one a synthetic fixture would not
+    have exercised. `out-claude` had four genuinely unattributed `refine_apply` entries; all four
+    resolved, and a repeat run left `audit.log` byte-identical.
+  - **Found by adversarial review, before shipping** — and the first one nearly shipped a feature
+    that destroyed its own purpose.
+    - **A second run wiped the attribution it had just frozen.** `derive` recomputed every row from
+      the CURRENT `policies.json`, which is precisely what the sidecar is a defence against: run the
+      command, re-scan, run it again, and every resolved row collapsed to `unknown` — permanently,
+      because `unknown` is sticky. The second use of the feature undid the first. **Two reviewers
+      found it independently**, which is the signal worth noting. The sidecar is now monotonic: a row
+      already on disk is carried forward verbatim and never recomputed, exactly like the append-only
+      log it annotates. Forcing a fresh derivation means deleting the sidecar — an explicit act, not
+      a side effect of running a command twice.
+    - **The sidecar was written non-atomically.** `write_text` truncates first, so a crash mid-write
+      left a half-written evidence file — and `load` swallows the resulting `JSONDecodeError`, so the
+      failure mode was losing every frozen attribution without a word. Written to a temp file and
+      `os.replace`d now. The skeptic verifying it went further and **found a weakness in the test
+      that was supposed to cover this**: `test_a_corrupt_sidecar_is_ignored_rather_than_fatal`
+      pinned "does not crash" but not "does not mis-attribute", because its fixture left the live
+      index agreeing with the frozen answer. With a re-scan that reused a policy name, a torn
+      sidecar fell through and produced a confidently wrong attribution — reproduced at 372 wrong
+      exports across 1,887 concurrent reads. So *absent* and *unreadable* are now different answers:
+      no sidecar means nobody froze anything and the live index is the best available guess, while a
+      sidecar that exists and will not parse means the live index is by definition not the one those
+      entries belong to, and the cell is left blank.
+    - **The bundle's caveats said nothing about it.** A derived sidecar that can supply a
+      `finding_id` is exactly what the manifest's caveat list exists to disclose; it now says what
+      the sidecar is, that it carries no identity, and that where it and the log disagree the log is
+      the evidence.
+    - **A corrupt `policies.json` tracebacked out of the CLI and 500'd the console.** Keeping the
+      raise for the apply paths (above) is right; propagating it out of a read-mostly evidence
+      command is not. An unreadable index means nothing can be established, which is a decline with a
+      reason.
+    - **Rich silently ate the `[dry-run]` marker.** `rprint(f"[dim]{m}[/dim]")` reads `[dry-run]` as
+      a markup tag and drops it — so the one word telling an operator that nothing was written was
+      the one word that vanished. Escaped at this command's log sink. The same pattern exists in
+      other commands whose messages contain brackets; only the one whose output actually does was
+      changed here rather than sweeping the CLI.
+    - **The two removed copies disagreed about duplicate policy names** — the exporter's inline dict
+      was last-wins, `find_finding_for_policy` first-wins — so consolidation could not preserve both.
+      First-wins is the deliberate unification: it matches the apply path, the safety-critical
+      consumer. Pinned, with the caveat that `policies.json` should never contain duplicates anyway.
+  - **Found while verifying the reviewers: consolidating the lookup silently changed three
+    behaviours.** Compared against the previous implementation across nine inputs, `policy_index`
+    had altered duplicate-name precedence (last-wins instead of first), filtered falsy `finding_id`s
+    to `None`, and swallowed a corrupt `policies.json` that used to raise. All three reach four
+    apply-path callers, where the corrupt-file case is the sharp one: returning `None` instead of
+    raising means applying a band-aid with weaker probe validation and no explanation. The old
+    semantics are restored exactly and pinned by a parametrized comparison; the exporter keeps its
+    own tolerance at its call site, and the backfill does its own `or None`. A consolidation that
+    quietly changes behaviour is worse than the duplication it removes.
+  - **The limit is stated rather than left to be discovered** (the J1 precedent). A forged sidecar
+    can move `finding_id` and the columns joined *through* it — `title`, `vuln_class`, `severity`,
+    `ledger_state`, `pr_url` — and nothing else: everything the log stamped is unreachable. That adds
+    no trust assumption the export did not already make, because `findings.json` and `ledger.json`
+    already drive those same joins and are the same kind of file in the same directory. Verified end
+    to end: the sidecar is digested in the bundle manifest, a clean bundle verifies at 47 members,
+    and a forged one is caught as `MISMATCH audit-backfill.json`.
+  - **Reconciled, and confirmed accurate:** `audit` is a flat `@app.command()` with no typer sub-app,
+    so `audit-backfill` matches the kebab convention. `export.build_audit_events` already left blanks
+    rather than inventing. The log cannot be rewritten (`audit.py` `_STAMPED`, enforced by
+    `test_identity_cannot_be_overridden_by_a_caller`), hence the sidecar. The duplicate lookup was
+    real — `ledger.find_finding_for_policy` and an inline copy in the exporter — and J4 would have
+    been the third; both now go through `ledger.policy_index`, the one implementation.
 
-- [ ] **J5** Weakness and framework mapping. (M, P2)
+- [x] **J5** Weakness and framework mapping. (M, P2) — **DONE:** `weakness.py` stamps every finding
+  with a CWE and an OWASP API Top 10 category, **by code, never by a model**. Carried through the
+  ledger, `audit.csv`, the audit-event join, reconcile's denormalization and a new **Findings by
+  OWASP API Top 10** group in the HTML report. 40 tests; suite 969 → 1009.
+  - **Four tiers, and the tier travels with the value** (`cwe_source`), because a fact and a
+    classification must not render the same way:
+    - **`advisory`** — OSV named the weakness. Verified live: `CVE-2024-23334` → `CWE-22`,
+      `GHSA-8r6j-v8pm-fqw3` → `CWE-94`. Quoted, never re-derived — `inputs/cve.py` deliberately
+      collapses `CWE-77/78/94` into one `command_injection` class, so mapping back would stamp a
+      *specific* CWE the advisory never claimed.
+    - **`evidence`** — the recorded exploit/legit pair *proves* a numeric-bound violation, so
+      `CWE-1284` is a fact about that finding. See the note below; this tier was not in the agreed
+      decision.
+    - **`mapped`** — derived from `vuln_class`.
+    - **blank** — no honest answer exists.
+  - **Checked against MITRE's own mapping guidance, at the source, not assumed.** Three CWEs the
+    project would naturally reach for are disqualified: **`CWE-840` (Business Logic Errors) is
+    PROHIBITED** — *"This CWE ID must not be used to map to real-world vulnerabilities"*, because it
+    is a Category — and **`CWE-200` and `CWE-287` are DISCOURAGED** (an impact and a Class rather
+    than root causes). So `business_logic`, `sensitive_data` and `broken_auth` map to **nothing** at
+    class level. Only ALLOWED / ALLOWED-WITH-REVIEW weaknesses are ever emitted, pinned by a test.
+  - **Three classes get no OWASP category at all, and that is the correct answer.** Injection was
+    **removed** from the API Security Top 10 in 2023 and *not* absorbed into API8 — the API8 page
+    never mentions it. So `sqli`, `xss` and `command_injection` are blank in the API axis rather
+    than forced into a category, which would be a wrong answer dressed as a taxonomy. They still
+    carry a CWE, which is the knowable half.
+  - **What the adversarial review changed.** Four defects survived my own review and are worth
+    recording, because three of them are the failure modes this project keeps hitting:
+    - **A model could fabricate the classification and the pipeline would persist it as a fact.**
+      The three fields live on `Finding`, which *is* the response model handed to the `discover`
+      agent — so they appeared in its wire schema, descriptions and all. The choke point's
+      `if not cwe_source` guard cannot tell a code-set value from a model-set one, so a response
+      carrying `cwe="CWE-840"` (the id MITRE **prohibits**) and `cwe_source="advisory"` was written
+      verbatim to `findings.json`, the ledger, `audit.csv` and the signed bundle, **labelled an
+      advisory fact**. "By code, never by a model" was therefore false as first written. The
+      discover loop now discards all three fields unconditionally, exactly as it already did for
+      `file`; a test asserts the discard and proves it with `CWE-840` so it cannot pass by the class
+      table coincidentally agreeing.
+    - **`broken_auth` → `CWE-1390` was the wrong sibling.** The class also holds missing auth
+      (`CWE-306`) and response-discrepancy enumeration (`CWE-204`), and MITRE offers *two*
+      destinations when leaving the DISCOURAGED `CWE-287`. It made the committed
+      `crapi-userenum-005` ("Username enumeration on signup") read as *Weak Authentication*. The
+      module's own rule is to map only where a class maps to exactly one weakness — `sensitive_data`
+      declines for the identical reason — so mapping this one applied the rule inconsistently. It
+      now declines and names the siblings it could not choose between. An advisory that names one
+      still wins.
+    - **"No honest mapping exists" was asserted where it could not be known.** The report gave that
+      as the reason for *every* blank, but a finding that predates J5 or reaches the report by a
+      path that bypasses the pipeline is blank for a completely different reason. `summary()` now
+      splits `declined` (a result) from `unstamped` (a defect) and the report says which — the
+      "we did not check this" vs "this is clean" rule, applied to a taxonomy.
+    - **The OWASP chart silently undercounted.** Its residual bar used `unclassified` (no CWE *and*
+      no category), so an `sqli` finding — `CWE-89`, deliberately no category — appeared in no bar
+      at all; on the committed demo dataset the chart accounted for 5 of 6 findings. The residual is
+      now derived from the total and the function asserts its own accounting. Separately,
+      `demo/build_demo_out.py` hand-writes its findings and so bypassed the stamp entirely, leaving
+      the most-viewed artifact in the repo unclassified.
+  - **A fourth tier the agreed decision did not anticipate — ACCEPTED 2026-08-04.** PR #24
+    settled on advisory / mapped / blank. Building it showed that leaves the **flagship finding
+    unclassified**: `business_logic` correctly maps to nothing, and `neg-pay-001` is
+    `business_logic`. But L1's `emitters.derive_numeric_constraint` *already* decides
+    deterministically, from two recorded requests, whether a finding is a numeric-bound flaw — so
+    `CWE-1284` (ALLOWED) is a fact about it, not a guess about its class. Measured on a real scan:
+    unclassified went **2 → 1**, and the tier correctly distinguishes two findings of the *same*
+    class — `neg-pay-001` gets `CWE-1284`, while `no-balance-check-002` (a missing state check, not
+    a quantity flaw) stays blank. It is narrow by construction: `business_logic` only, and only when
+    the probe pair proves it. Put to the owner as a keep-or-reject with the revert scoped, and
+    **kept** — so `advisory` / `evidence` / `mapped` / blank is now the settled tier set and
+    supersedes PR #24's three. It does not reopen: the tier is only ever reached when
+    `derive_numeric_constraint` returns a bound, which is code, not a model.
+  - **Acceptance, as met — with one criterion rewritten** (the G2/G4/I2/K2/L1 precedent):
+    - "every finding in `findings.json` carries a CWE" → **rewritten**: every finding carries a
+      `cwe` *field*, and a finding whose class has no honest mapping carries it **empty with the
+      reason available**. On a real 12-finding scan, 11 are classified and 1 is not. Refusing to
+      guess is the behaviour this project ships.
+    - the HTML report groups by category ✅ — and renders **`(not classified)`** as its own bar,
+      because a chart showing only the classified findings would overstate the coverage.
+    - `audit.csv` includes the columns ✅ — `cwe`, `owasp` **and `cwe_source`**, since a reviewer
+      must be able to tell a fact the advisory stated from a classification this tool made.
+    - stated as a classification, not a certification ✅ — in the report, in as many words.
+  - **Optional fields, deliberately.** A required field on `Finding` would be a prompt change to
+    `discover`, the most recall-critical agent in the pipeline and exactly what G4's committed
+    four-provider scorecard measures. Optional means the agent is never asked and the benchmark
+    cannot move; the recorded golden still validates untouched.
+  - **Four whitelists would have silently dropped the fields** — the ledger entry, `export.COLUMNS`,
+    the audit-event join and reconcile's denormalization each copy a hand-picked key set and none
+    would have errored. A field that reaches `findings.json` and nothing else is half a feature that
+    looks whole; a parametrized test now pins all four.
+  - **Fixed en route (pre-existing, found while adding the OWASP chart):** `report.py`'s `.fill` is a
+    `<span>`, and an **inline element ignores height and a percentage width** — so C5's severity and
+    band-aid-coverage bars had *never* drawn a bar. The width and colour were computed correctly all
+    along (`style="width:33%;background:#a1001b"`) and silently discarded; every track rendered
+    empty. Noticed because all three charts were uniformly blank, not just the new one. One
+    `display:block`, pinned by a test.
   Stamp each finding with a CWE ID and an OWASP API or Web Top 10 category at triage, and
   carry them through the ledger, report, and export.
-  - **Decide where the field lives first:** `findings.json` is a dump of the *discover* contract
-    (`Finding`, `schemas.py:47-61`, written at `pipeline.py:301`); triage's output is
-    `TriageDecision` in `triage.json`. Either add optional `cwe`/`owasp` to `Finding` and have the
-    pipeline back-fill them from the triage result before `_write_out`, or put them on
-    `TriageDecision` and reword the acceptance to name `triage.json`.
+  - **DECIDED 2026-08-02 — optional `cwe` / `owasp` on `Finding`, populated by CODE, never by a new
+    agent call.** The item framed this as a choice between two files; measuring the pipeline shows
+    it is really a question of what the field *is*.
+    - **The "either/or" was mechanically empty.** `findings.json` and `triage.json` are written
+      together in `_write_out` (`pipeline.py:543-544`), called at `pipeline.py:505` — *after* triage
+      at `:343`. Back-filling `Finding` from the triage result needs no reordering at all, so
+      feasibility never distinguished the two options. (The item's `pipeline.py:301` citation for the
+      write had drifted.)
+    - **A CWE describes the weakness, not the mitigation.** `CWE-89` is a property of the flaw;
+      `TriageDecision` answers which control covers it. The category error shows up immediately at
+      the edges: a `no_bandaid` finding still has a CWE, and one finding with a stack of two
+      band-aids does not have two CWEs.
+    - **Optional is what keeps it safe.** `Finding` is the *discover* contract, and a required field
+      there is a prompt change to the most recall-critical agent in the pipeline — the exact number
+      G4's committed four-provider scorecard measures. Optional means discover never has to emit
+      them and the benchmark cannot move.
+    - **Populated by code, with the provenance carried.** `inputs/cve.py:34` already holds
+      `CWE_CLASS` (21 CWEs → 10 `VulnClass` values, added by H1 precisely so "the agent only has to
+      guess when it does not"); J5 inverts it. Three tiers, and which tier a value came from ships
+      with it: **`advisory`** — OSV handed us `cwe_ids`, so it is a *fact*, not a classification
+      (H1/H2 findings); **`mapped`** — derived deterministically from `vuln_class`, a classification
+      the tool made; **blank** — `vuln_class` is `other`, so there is no honest mapping and none is
+      invented. That last tier is the H2 `unpinned` precedent: a guess that looks like an answer is
+      worse than a gap. It also stops the acceptance's "state it as a classification" caveat from
+      *understating* the advisory case while overstating the mapped one.
+    - **OWASP API Top 10 is the primary**, not Web: this tool reasons in endpoints, service policies
+      and API schemas, and the regulated buyers the note names ask in those terms. A Web Top 10 field
+      is a second optional column if anyone asks, not a default.
+    - Consequence for the acceptance below: "every finding in `findings.json` carries a CWE" is
+      **rewritten** — every finding carries a `cwe` *field*, and a finding whose class is `other`
+      carries it empty with the reason visible, because refusing to guess is the behaviour this
+      project ships. `audit.csv` gains `cwe` / `owasp` / `cwe_source`.
   - Acceptance: every finding in `findings.json` carries a CWE; the HTML report groups by
     category; `audit.csv` includes the columns; the mapping is stated as the agent's
     classification, not a certification claim, matching the honesty of the existing caveats
@@ -580,32 +1085,243 @@ sees the trail. J1–J4 are the open `BACKLOG.md` evidence entries, scheduled; *
 
 ## Phase K — Reach developers without the console
 
-- [ ] **K1** MCP server mode. (M, P1) Depends on G2 and I1.
-  Expose the read-only surface as MCP tools so an agent session gets a band-aid proposal
-  inline: `scan`, `triage`, `generate`, `simulate`, `patches list`.
-  - Acceptance: apply, pr, retire, and reconcile are absent from the tool list unless
-    explicitly enabled in config; **enabling them does not bypass the human gate** — a write
-    tool still routes through the same gate and guardrails as the CLI and console; tool schemas
-    document every argument; the server calls the same module functions as the CLI and console.
-  - **Reconciled:** `simulate` needs G2 and `patches list` needs I1; the item declared no
-    dependencies.
-  - Surfaces: `src/vpcopilot/mcp.py`, `vpcopilot mcp`.
+- [x] **K1** MCP server mode. (M, P1) — **DONE:** `vpcopilot mcp [--write]`. `mcp.py` is a
+  hand-rolled Model Context Protocol server over stdio — **no new dependency** — exposing ten
+  read/scan tools always and five mutating ones only when writes are explicitly enabled.
+  **Verified against a real MCP client**: registered with Claude Code, `✔ Connected`, tools
+  enumerated, and driven end to end over a real subprocess pipe against the live H2 run data and
+  live OSV. 53 tests.
+  - **Acceptance, as met:** apply/pr/retire/reconcile (and `simulate`) are **absent** from
+    `tools/list` unless enabled ✅ — absent rather than present-and-refusing, because a tool an agent
+    can see is a tool it will try; every write tool calls the same module function the CLI and
+    console call ✅, so it inherits `guard_lb`, `PROTECTED_POLICIES`, `drift.preflight`, the G2
+    blast-radius gate, rollback-unless-`keep` and a centrally-stamped audit record rather than
+    reimplementing any of them; every argument of every tool carries a description ✅, pinned by a
+    test that walks the schemas rather than by review.
+  - **The acceptance criterion could not be met as written, and fixing that is the largest change
+    here.** "The same gate and guardrails as the CLI and console" presumes the two agree. They did
+    not: `simulate.promotion_block` — the G2 blast-radius gate — had exactly **one** production
+    caller, `console/app.py`, so `vpcopilot apply --from-scan` would attach an over-broad policy the
+    console refuses with a 409, and the `--allow-overbroad` flag **this file described at line 143
+    did not exist**. Same shape as I1's `--force-probe`, whose guard lived only in the CLI and left
+    the console able to mass-replay every destructive exploit. So the check moved into
+    `simulate.promotion_gate`, called by **both** `apply.apply_from_scan` and
+    `refiner.refine_apply_service_policy` (the latter is the default for `--from-scan` and the
+    console's Mitigate button, so gating only the former would have gated nothing anyone uses), and
+    the CLI gained the flag. **This is a deliberate behaviour change to a shared write path**: a CLI
+    apply now refuses an over-broad policy unless `--allow-overbroad`, and writes the
+    `simulate_override` audit record it previously never wrote. Still warn-with-audited-override, not
+    a machine veto (the G2/I2 precedent). Pinned in both directions, including that a policy with no
+    simulation applies exactly as before.
+  - **`simulate` is not read-only, and the item listed it as such.** G2's simulation creates a
+    throwaway `<name>-vpcsim` policy object, **attaches it to the load balancer**, replays through it
+    and deletes it. Cleaning up after itself makes it safe, not read-only, so it sits behind the same
+    opt-in as `apply`; `simulation_result` is the ungated way to read a previous run's numbers. The
+    three-tier taxonomy this forced — `READ` / `WRITES_OUT` (a scan, additive, tenant untouched) /
+    `MUTATES` — drives the MCP annotations from one `Access` value per tool, so `readOnlyHint` and
+    `destructiveHint` cannot drift from the truth.
+  - **stdout belongs to the protocol, and this codebase is the worst possible tenant for that.** The
+    spec forbids writing anything to stdout that is not an MCP message, and `run_pipeline`,
+    `survey_report` and `drift.check` all default `log=print`, with `rprint` used throughout the CLI.
+    Passing `log=` at every call site is a convention, and a convention is what the next call site
+    forgets — so `serve()` reassigns `sys.stdout` to stderr for its lifetime and writes frames to a
+    private handle, which makes a stray `print` **anywhere beneath it** structurally incapable of
+    corrupting the stream. Verified empirically that `rich` follows the swap (it resolves
+    `sys.stdout` at write time rather than binding it at import), and pinned by a test that prints
+    from inside a tool.
+  - **A scan is start-then-poll, not one blocking call.** A scan takes minutes and an MCP call is
+    request/response, so `scan_start` returns a job id and `scan_status` tails the log with a `since`
+    cursor — the same shape the console already uses, with none of its FastAPI coupling. The log sink
+    is a list, so progress is returned to the caller rather than written anywhere.
+  - **Decisions.** *Stdlib, not the official SDK* (which is available, at 2.0.0): the surface K1 needs
+    is `initialize` / `tools/list` / `tools/call` / `ping`, hand-rolling it keeps `vpcopilot mcp`
+    working with no extra install unlike `console`, it is testable offline by feeding frames to
+    `handle()`, and it avoids pinning a major-version API that churns under a committed demo. The
+    interop risk is real but bounded, and it was retired by testing against a real client rather than
+    by argument. *Opt-in is `--write` or `VPCOPILOT_MCP_WRITE=1`*, not a key in `agents.yaml` —
+    `config.py` is an agent-model registry and a feature flag does not belong in it; authoring the
+    client config is the human action, exercised once, which is the argument I1 made about the
+    crontab. *`apply`/`pr`/`retire` default to `dry_run=True`*, inverting every module default,
+    because the CLI and console each pass a choice a human made at a keyboard and an MCP call is
+    issued by a model. *`force_probe` is not exposed at all* — its guard needs a single `--finding`
+    because replaying every destructive exploit at once is not something to do by accident, and a
+    model deciding to pass it is exactly that accident. *`apply` takes a policy **name**, not a
+    path*, derived against the run directory (the J2 precedent), validated as a slug and checked to
+    resolve inside `<out>/policies`; traversal already failed because the mandatory `service_policy.`
+    prefix makes the first segment a directory that must exist, which is luck rather than design.
+  - **What the opt-in cannot do is supply the human.** MCP clients are expected to confirm tool calls
+    with a user, but that is client behaviour this server can neither enforce nor verify — stated in
+    `docs/USAGE.md` rather than implied, and the reason the write tools are off by default.
+  - **Fixed en route (pre-existing):** `apply_from_scan(create_only=True)` returned before
+    `apply_service_policy`, the only caller of `guard_lb`, so it wrote a policy object into the tenant
+    with neither the protected-LB check nor the drift preflight. It attaches nothing, so no traffic
+    changed — but a persistent write against a protected target should not be the one path that skips
+    the guard. `guard_lb` is now unconditional at the top of `apply_from_scan`; it is a pure check, so
+    the other paths are unchanged.
+  - **Found by adversarial review, before shipping** (18 raised across five failure dimensions; 12
+    verified, of which 3 were confirmed outright and 9 were refuted **because they had already been
+    fixed mid-review** — the skeptics were reading the patched tree, as happened in H2 — plus 6 lower
+    -severity ones triaged afterwards). The two that mattered:
+    - **A malformed `tools/call` killed the server outright, with zero frames written.** JSON-RPC
+      permits positional (array) `params`, and a list is truthy, so `params.get(...)` raised straight
+      out of `serve()`'s loop; a non-string tool name did the same through an unhashable dict lookup.
+      The client waits forever on a request that will never be answered and every later request is
+      lost with it. Dying silently is the worst available failure for a transport. Both inputs are now
+      invalid-params, and — the structural half — the loop wraps `handle()` and answers `-32603`
+      rather than ending, so a bug not yet written cannot kill the connection either.
+    - **A narrower replay erased an earlier policy's blast-radius flag.** `simulate --policy B`
+      filters the candidates and `write_result` overwrote `simulation.json` wholesale, so a policy A
+      an earlier run had flagged lost `blocked_promotion` — and the gate above went quiet for it. An
+      operator who simulated everything, saw A flagged, then re-simulated only B would find A
+      applying with no warning: a guard erased as a side effect of measuring something else, which is
+      I1's "a band-aid could vouch for its own removal" in a new place. Entries this run did not
+      measure are now carried forward stamped `carried_from`, so the gate keeps firing and nothing
+      passes an old number off as fresh. Pre-existing in G2; the gate move is what made it load-bearing.
+    - **A regression this change introduced, caught here:** the legacy `POST /api/apply` — still
+      served though the UI no longer calls it — began enforcing the moved gate while `ApplyReq`
+      carried no `allow_overbroad`, turning warn-with-audited-override into an unoverridable machine
+      veto on that one surface. All four call sites of the two gated functions now expose the flag.
+    - Plus: a `tools/call` `TypeError` was reported as *invalid arguments*, which would send an agent
+      round a loop retrying arguments against a fault inside a tool (there is now deliberately no
+      `except TypeError`, because `validate_args` makes an argument-binding error unreachable and a
+      test pins that every documented property is a real parameter); `scan_status` read the log twice
+      and could advance its cursor past what it returned, losing lines a client could never re-request
+      (proven at 565 of 20000 polls); a corrupt `findings.json` rendered as `[]` — the H2 confusion,
+      reproduced in new code — so an unreadable member is now `null` and named in `unreadable`;
+      `impact`/`ledger`/`patches_list` answered a **nonexistent** run directory with confident zeros;
+      `scan_start` accepted a path that does not exist, which `run_pipeline`'s own docstring calls
+      "the failure mode not to extend"; two scans into one run directory interleaved their artifacts;
+      a notification whose method was a request method was answered with an unsolicited `id: null`;
+      stdin was decoded with the process locale rather than the mandated UTF-8; and the `drift` tool's
+      description promised a shadowing check that does not run without `policy`.
+  - **Reconciled, and confirmed accurate:** `triage` and `generate` have **no module function to
+    share** — both take a live `Harness` plus pydantic models with no CLI or console twin — so v1
+    exposes them only as stages inside `scan_start` rather than inventing twins for them. `vpcopilot
+    mcp` matches the flat command set; there is no `serve` verb.
   - Note: pairs with the vendor's own Distributed Cloud MCP server effort. Keep them independent.
-    This one exposes the pipeline, not the tenant.
-  - **Reconciled:** there is no `serve` command — `console` (`cli.py:499`) is the only launcher, so
-    a second verb would be a new convention; `vpcopilot mcp` matches the flat command set. Two of
-    the five listed tools have **no module function to share**: `triage` and `generate` exist only
-    as agent entry points taking a live `Harness` plus pydantic models (`agents/triage.py:57`,
-    `agents/generate.py:94`), with no CLI or console twin. Either scope v1 to surfaces that exist,
-    or add a sub-item creating those twins first. The dependency is also transitive — G2 is itself
-    gated on the undecided G1.
+    This one exposes the pipeline, not the tenant — `mcp.py` never imports `xc`, pinned by a test.
 
-- [ ] **K2** GitHub Action. (M, P2) Depends on G2.
-  Scan the diff on a pull request and comment each new finding above a severity threshold
-  with the proposed band-aid and its would-block count.
-  - Acceptance: a PR introducing a known flaw gets one comment carrying the policy and the
-    simulation result; a PR with no new findings posts nothing; runs in under three minutes
-    on the Nimbus repo; never writes to XC from CI.
+- [x] **K2** GitHub Action. (M, P2) — **DONE:** `.github/actions/vpcopilot-scan/` (a composite
+  action), `.github/workflows/pr-review.yml`, `src/vpcopilot/ci.py`, `vpcopilot ci-review`, and
+  `docs/CI.md`. Scans a pull request's diff against the **merge base** and leaves one comment
+  carrying, per finding above a threshold, the F5 XC control triage routed it to and the generated
+  policy name. Verified live against the Nimbus fixture. 40 tests.
+  - **Acceptance, as met:** a PR introducing a known flaw gets **one** comment carrying the policy ✅
+    (live: a deliberately vulnerable `/api/refund` route → three findings, four policies across
+    `service_policy`, `waf`, `malicious_user` and `rate_limit`); a PR with no findings above the
+    threshold posts **nothing** ✅ — silence is the correct output, because a bot that says "all
+    clear" on every PR trains people to stop reading it; **75–77 s** on the Nimbus repo against a
+    three-minute budget ✅; never writes to XC ✅, structurally (below).
+  - **The acceptance criterion contradicted itself, and this is the resolution.** It asked for one
+    comment carrying the policy *and the simulation result* while also requiring *never writes to XC
+    from CI*. Both cannot hold: G2's blast-radius measurement creates a throwaway policy object,
+    **attaches it to a load balancer**, replays recorded traffic through it and deletes it — three
+    tenant writes — and there is no offline evaluator to fall back on, because G1 was deliberately
+    deferred. So a would-block count is **not computed in CI**. The comment reports blast radius only
+    from a `simulation.json` produced by a real tenant run (committed, or passed via the
+    `simulation-json` input), and otherwise says in as many words that no measurement was made and
+    what it would take. Neither silence nor `0%` would do: both read as *measured and safe*. Same
+    precedent as G2's own rewritten criterion, G4's reproducibility, and I2's conflict criterion.
+  - **The defect that would have shipped a silent all-clear.** `git diff --name-only` answers relative
+    to the **repository root**; `collect_files` matches relative to the directory it is given; and this
+    project's own app fixture lives eight levels down. Compared directly the two never match — zero
+    files scanned, no findings, and the pull request told it is clean. Catching it requires noticing
+    the *absence* of an error, which is the hardest kind of bug to see in a review. `rebase_onto()`
+    translates the paths and returns a count of changed files that fall outside the scanned directory,
+    which the comment discloses.
+  - **Never writes to XC, by construction rather than by care.** `ci.py` imports no `xc`, no `apply`,
+    no `refiner`, no `simulate` and no `promotion_gate`, so there is no code path from CI to a load
+    balancer — pinned by a test that reads the module's own source, which is the only version of that
+    guarantee that survives someone adding a convenient import later. The action declares no XC
+    inputs, so there is nothing to pass one through, and `ci-review` says so out loud if it finds an
+    XC credential in its environment, because it has no use for one.
+  - **Every boundary is disclosed rather than left to be assumed** — the theme of H2 and H3, applied
+    to a comment a developer reads in ten seconds: changed files outside the scanned directory, files
+    over the size cap or beyond `--max-files`, findings held back by the threshold (counted when
+    nothing is reported, so "we did not report this" never reads as "there was nothing"), deleted
+    files, and the absent blast radius. The all-clear branch carries the unscanned remainder too.
+  - **Decisions.** *Additive plumbing, not a new scan path*: `collect_files(..., only=)` and
+    `run_pipeline(..., only_files=)` filter the existing walk, so a changed file that is vendored,
+    unsupported or oversized is still excluded and reported exactly as in a full scan, and the
+    existing call path is untouched. *No cure drafting* — the developer is editing the file by hand
+    right now; the band-aid and the finding are what CI can add, and drafting is the expensive half.
+    *One comment, updated in place*, anchored on a hidden marker, because a branch pushed ten times
+    should not produce ten comments. *`fail-on-findings` defaults to false* — the comment is the
+    deliverable, and a red check on a finding the team has decided to accept is how a useful bot gets
+    switched off. *`pull_request`, never `pull_request_target`*: the latter runs trusted workflow code
+    with secrets against untrusted head code, which is the standard way a repository leaks its
+    secrets. The consequence — fork PRs get no review — is documented, not discovered.
+  - **Found by adversarial review, before shipping** (21 raised across four failure dimensions; 12
+    verified — 2 confirmed and 10 refuted, again mostly because they had already been fixed while the
+    review ran — plus 9 lower-severity ones triaged after). Almost every real finding was one shape:
+    **a failure rendering as an all-clear.**
+    - **Refuted candidates were being reported as findings.** `findings.json` is the *discover*
+      contract — every candidate, including the ones `verify` refuted as false positives — and the
+      filter compared that set against itself, so it was a no-op. Triage runs only over the verified
+      set, so a triage decision is what "survived verification" looks like on disk. Putting refuted
+      false positives in front of a developer with a band-aid attached is the fastest way to teach a
+      team to ignore the bot.
+    - **A diff with nothing scannable produced an *empty* comment**, so `--comment-out` wrote no file
+      and the action's step summary fell through to "no findings at or above the threshold" — a clean
+      bill of health for a diff that was never analysed. This was reachable by default: the shipped
+      workflow triggers on any `**/*.py` change while scanning one fixture directory. Now a comment
+      that says *nothing was reviewed*, and says it is not a clean bill of health. Still posts nothing
+      to the PR, because there is nothing to report.
+    - **Truncating an oversized comment deleted exactly the disclosures.** GitHub caps a body at
+      65,536 characters; cutting from the end removed the "N files were not scanned" and "N sit
+      outside the scanned directory" lines — the sentences that stop a partial review reading as a
+      complete one. The finding list is cut instead and the disclosures always survive.
+    - **A crash exited 1, which the action reads as "findings reported".** So a review that never
+      completed looked like a completed one, and the workflow went on to publish a comment file that
+      did not exist. Unexpected failures now exit 2, and the summary distinguishes a crash from a
+      clean review by consulting the step outcome.
+    - **Three more ways a meaningless blast-radius number read as safe**, each carried through from
+      G2 rather than flattened into a rate: a simulation that could not confirm the edge was
+      *enforcing* the policy (G2's own first live defect — an unenforced policy blocked 0 of 200 and
+      looked harmless); one that evaluated *zero* requests because they all failed in transit; and one
+      replayed against XC access logs, which carry **no request bodies**, so a `body_matcher` policy
+      matches nothing and scores a perfect 0% that `simulate` itself had declared unjudgeable.
+    - Plus: git **quotes** non-ASCII paths (`"caf\303\251.py"`), so its suffix read as `.py"`, no
+      extension matched, and the file was neither scanned nor counted as outside — it vanished, and
+      the PR was told it was clean (`-z` output is unquoted); a caller passing the natural
+      `base: origin/main` got `origin/origin/main` and no merge base; every action input reached bash
+      through a `${{ }}` text substitution rather than the environment; `--min-severity` was
+      unvalidated and fell through to `high` while the comment stated the value the caller asked for;
+      the header's "scanned N of M" used the post-filter count as its denominator, so a fourteen-file
+      diff read as "1 of 1"; and the "not scanned" line named only the caps when the count also
+      includes vendored directories and unsupported file types.
+  - **Two defects only CI could find, and both are worth reading.** The suite passed locally and the
+    PR went red immediately.
+    - **The moved G2 gate needed tenant credentials to refuse.** `refine_apply_service_policy` and
+      `apply_from_scan` both constructed `XC()` before reaching the gate, and `XC.__init__` raises when
+      `XC_API_URL`/`XC_API_TOKEN` are unset — so on a runner without credentials "this policy is too
+      broad" came back as "XC_API_URL not set". The test passed locally *only because the developer's
+      `.env` happened to have them*: a test that quietly depended on developer-local state, which is
+      precisely what "tests run offline against fakes" exists to prevent. Every refusal that needs no
+      tenant now precedes `XC()`, which is also better behaviour — an over-broad policy should be
+      refused whether or not a tenant is reachable. Reproducing CI locally is one `env -u` away and is
+      now part of the check.
+    - **A comment inside the action broke the action.** The runner parses Actions expression syntax
+      anywhere in a `run:` block — **comments included** — so a comment that spelled out an empty
+      expression while explaining the script-injection hazard failed the whole action to load with
+      "An expression was expected". Neither local check could see it: `pyyaml` parses YAML rather than
+      Actions templates, and the test that scanned for interpolations skipped comment lines, which is
+      exactly where the offending text was. The test no longer skips them, because the runner does not.
+  - **Found while fixing those:** the repository has **no secrets configured**, so
+    `secrets.ANTHROPIC_API_KEY` is the empty string — and `required: true` on an action input is not
+    enforced against an empty value. The action would have scanned nothing and produced a review that
+    read as clean, which was also a review finding left open. It now fails loudly on an empty key and
+    names the cause, and the workflow skips with a stated "this is not a clean bill of health" summary
+    rather than going permanently red for something no PR author can fix. The `paths` filter was also
+    scoped to the directory the action actually scans — it fired on any `**/*.py` change and then
+    scanned zero files, spending a credential and a runner to review nothing.
+  - **The fixture lives in `bench/fixtures/ci/`, not in the Nimbus app, and that is not tidiness.**
+    `bench` scans `bench/fixtures/nimbus-vuln-lab/app/src/app/api` against `answer_key.yaml`, and a
+    new vulnerable route there produces findings listed in neither `expected` nor `bonus` — which
+    `bench.py` scores as **noise**. Committing the fixture inside the scan target would have silently
+    degraded the precision column of G4's committed scorecard and `BASELINE.md`: a benchmark
+    regression caused by a test fixture. Pinned by a test, and the reason is in the fixture's README
+    so the next person does not helpfully move it back.
   - Surfaces: `.github/actions/vpcopilot-scan/`, `docs/CI.md` (every file in `docs/` is
     uppercase).
 
@@ -613,22 +1329,306 @@ sees the trail. J1–J4 are the open `BACKLOG.md` evidence entries, scheduled; *
 
 ## Phase L — One finding, every enforcement point
 
-- [ ] **L1** Emitter abstraction and non-XC backends. (L, P2) **Decision needed.**
-  Refactor `generate` output behind an emitter interface and add NGINX App Protect,
-  BIG-IP ASM, and ModSecurity backends. Generation only, no apply.
-  - Acceptance: the Nimbus negative-amount finding emits a working rule on all four
-    backends; a control with no equivalent reports `unsupported` with the reason rather than
-    emitting a broken rule; adding a backend touches nothing outside the emitter package;
-    `controls.py` keeps the XC registry unchanged.
-  - Surfaces: none stated. `src/vpcopilot/emitters/` would be a **third** sanctioned package
-    alongside `agents/` and `console/` — everything else is flat under `src/vpcopilot/`. Settle
-    that with the `inputs/` question in H1, or use a flat `emitters.py` with a registry keyed the
-    way `controls.py` is.
-  - Decision: the triage toolbox in `DESIGN.md` is XC-shaped by design, and the seven
-    controls map to XC objects. Three questions before starting. Does one finding covering
-    BIG-IP and NGINX strengthen the hybrid-fabric story enough to carry the abstraction
-    cost. Does ModSecurity output belong here as the contributor hook, or does it dilute the
-    XC proof. Does the emitter refactor wait until the pipeline stops changing shape.
+- [x] **L1** F5 declarative WAF policy emitter. (M, P2) — **DONE:** `emitters.py`, `vpcopilot emit
+  --target <name>`, `POST /api/emit` + `GET /api/emit-targets`, and an emit card on ② Review.
+  **Proven on the real appliance:** the emitted policy blocked the recorded exploit and passed the
+  recorded legit request against Larkspur behind the L2 BIG-IP. 44 tests; suite 914 → 958.
+  - **Acceptance, as met:**
+    - **blocks the exploit / passes the legit request on a real BIG-IP** ✅ — and the proof is the
+      **balance, not the status code**: attacker `48215` → exploit fired → **`48215`, unchanged**,
+      while the legit transfer went through (`48215` → `45715`). The exploit's response was ASM's
+      `Request Rejected` page, not the app's JSON. Removing the policy makes the exploit work again,
+      so the block was the policy and not something else.
+    - **the same object with only `template.name` swapped validates against the NAP schema** ✅ —
+      and **non-vacuously**, which took a deliberate choice (below).
+    - **a control with no declarative equivalent reports `unsupported` with a named reason and emits
+      nothing** ✅ — `rate_limit`, `malicious_user`, `bot_defense`, plus an honest decline for `waf` /
+      `waf_data_guard`, which *have* an equivalent this emitter does not yet implement.
+    - **the XC path is byte-identical and `controls.py` is unchanged** ✅ — pinned by a test that
+      reads `emitters.py`'s own source and fails if it imports `controls` at all.
+    - **adding a target touches only the emitter module** ✅ — a target is a row in `TARGETS`; even
+      the console's picker reads the registry rather than hardcoding a list.
+  - **`probe.probe_from_spec` needed no change at all**, which is the quiet result. It was written
+    for XC and is target-agnostic, so the two-request proof `apply.py` makes was pointed at a BIG-IP
+    unmodified. More than that: **BIG-IP's blocking page returns HTTP 200** with a support ID, so a
+    naive status check reads a block as a pass — `probe.blocked_by_edge()`, added in I1 to stop a
+    band-aid vouching for its own removal, is what told them apart on an appliance it was never
+    written for.
+  - **The constraint is derived by CODE from the two recorded requests, and that is the item's real
+    content.** The exploit sends `amount_cents: -50000`, the legit request sends `2500`, so the
+    field, its type and the bound are facts — "agents reason, code acts", applied to a number an
+    operator acts on. Where the evidence does not establish exactly one such field (two candidates,
+    none negative, nothing recorded, a non-numeric value), it **declines with a reason**: a policy
+    built on the wrong parameter blocks nothing and looks applied.
+  - **Six traps, and only two are visible to a schema.** The item listed three; the live run found
+    two more, and analysing the schemas found the sixth:
+    - `dataType: "integer"` does not reject `-500` — the sign rejection is `minimumValue` alone.
+    - the constraint only ALARMS unless `VIOL_PARAMETER_NUMERIC_VALUE` is `block: true`.
+    - `parameterLocation` has no `json` value; a body value is reachable only via a `json-profile`.
+    - **NEW, from the live import: the URL's protocol is part of its identity.** The emitter
+      hardcoded `https` while the lab VS is `http`, which would have imported cleanly and matched
+      nothing. Now a parameter that must match the virtual server.
+    - **NEW, and only the appliance says so: ASM REFUSES a URL whose content-profile list omits the
+      default `*:*` entry** — *"[fatal] Could not add the URL '[HTTPS] POST /api/transfer'. The
+      default URL Content Profile (*:*) is mandatory."* Neither schema requires it. This one at
+      least fails loudly.
+    - **The schemas cannot catch the others.** Measured: `additionalProperties` is absent from
+      **all 127 NAP and 173 BIG-IP object nodes**, and `violations[].name` is a **free string** in
+      both — `VIOL_PARAMETER_NUMERIC_VALUE` does not even appear in the BIG-IP schema. An invented
+      section, a misspelled `parmeters`, or a typo in the violation that arms the block all validate
+      green. A test pins that weakness deliberately, so the day the schemas start closing objects,
+      it fails and someone re-reads `PROVENANCE.md`.
+  - **The acceptance criterion is weaker than it reads, and was made meaningful rather than
+    faked** (the G2/G4/I2/K2 precedent). "The same policy with only `template.name` swapped
+    validates against NAP" is vacuous if the emitter uses the *NGINX* name — NAP constrains
+    `template.name` to a single-value enum while BIG-IP leaves it a free string, so the NGINX name
+    passes **both**. The emitter therefore emits the **BIG-IP** name, and the test asserts the
+    pre-swap object **fails** NAP before asserting the post-swap pass. Otherwise it would certify
+    nothing.
+  - **`WAF_Policy.policy` is an `F5string` — a reference, not an inline object.** The item's AS3
+    decision said "one POST is the attach", which is true, but the policy travels **base64-encoded**
+    inside it; posting the object inline is rejected with `Invalid data property: [object Object]`.
+    Read off the appliance's own `adc-schema.json`, since AS3's `/schema` endpoint does not serve it.
+  - **Answered, and it was a first-run check rather than a blocker:** the item's open question about
+    how ASM names a parameter extracted from **nested** JSON is still undocumented by F5 — so a
+    nested parameter is **emitted with a caveat on the result** rather than silently trusted. The
+    flagship is top-level, so the proof did not depend on it.
+  - **Already existed, contrary to the item's decision list:** `GeneratedArtifacts.items` with
+    `min_length=1` was built long before this, for the same reason (a weak model satisfying the
+    schema with an empty list). The emitter's `unsupported` therefore reuses the principle rather
+    than introducing it: an explicit `supported=False` + reason, never an empty collection.
+  - **Found by adversarial review, before shipping** (42 raised across five failure dimensions; 7
+    confirmed after independent skeptics tried to refute each). The first is the one worth reading:
+    - **`dataType: "integer"` would have declared 49% of known-good traffic illegal.** The emitter
+      inferred the type from the two probe samples, which happened to be whole. Measured against
+      **this repo's own G2 traffic corpus**: 30 of 61 recorded legitimate `/api/pay` requests carry
+      a fractional amount (17.5, 32.5, …). And `integer` contributes **nothing** to the negative
+      rejection — that is `minimumValue` alone, as the module's own TRAP 1 says — so it was pure
+      cost: a 49% false-positive surface, 49× G2's own blast-radius threshold, for no enforcement.
+      Now always `decimal`, which takes `checkMinValue` identically. The one place the emitter
+      deliberately refuses to generalise from its samples.
+    - **A model-chosen `policy_name` crashed the CLI.** `policy_name` is a free string the *generate*
+      agent picks (`schemas.py` calls it kebab-case; nothing validates it) and Rich parses markup
+      inside table cells, so a name carrying a closing tag raised `MarkupError`, printed a traceback
+      and wrote **nothing** — after the constraint had derived correctly. Every cell is escaped now.
+    - **…and writing the test for that found the better defect: the same name reaches a FILENAME.**
+      `../../escaped` resolves outside the output directory. Sanitised and bounded, the K1 precedent.
+    - **Three mutations survived the entire suite**, which is the review earning its keep: forcing
+      the emitted parameter **name** to a constant, forcing the URL **path/method**, and changing the
+      JSON profile's **content-type** all left 944 tests green. The first is the sharpest — the
+      constraint could have been derived perfectly and then written about a *different field*,
+      producing a policy that validates, imports, and matches nothing. All three are pinned now.
+    - **A corrupt `policies.json` tracebacked out of the CLI and 500'd the console.** It is rewritten
+      by every scan and can be caught mid-write; an unreadable index means nothing can be
+      established, which is a decline with a reason (the J4 precedent).
+  - **Re-proven on the appliance AFTER the fixes**, because a `decimal` policy is not the one that
+    was originally validated: exploit blocked with the balance unchanged at `48215`, legit transfer
+    through, and a fractional legit amount — the case the fix exists for — also through.
+  - **Both schemas are vendored** (`tests/fixtures/waf-schemas/`) with sha256s recorded, because
+    tests run offline and both are regenerated per product release — the digest *is* the version.
+    The NAP schema turned out to be **public** (`nginx/documentation`, BSD-2-Clause), which the item
+    assumed it was not; F5's own NAP docs give no download URL and tell you to generate it on an
+    installed host, which is the subscription-gated path.
+  - Original acceptance, for reference:
+    - The negative-amount finding emits a declarative policy that, **loaded onto a real BIG-IP with
+      Advanced WAF, blocks the recorded exploit and passes the recorded legit request** — the same
+      two-request proof `apply.py` already makes against XC, via the same
+      `probe.probe_from_spec(target_url, …)`, which is already target-agnostic.
+    - The same policy object, with only its `template.name` swapped, validates against the NGINX
+      App Protect schema.
+    - A control with no declarative equivalent reports `unsupported` **with a named reason**, and
+      emits nothing.
+    - The XC path is byte-identical; `controls.py` keeps the XC registry unchanged.
+    - Adding a target touches only the emitter module and its tests.
+  - **The three questions that blocked this are answered.** (1) *Is the hybrid-fabric story worth
+    the abstraction cost?* — **yes** (maintainer, 2026-07-30). (2) *Does ModSecurity belong?* —
+    **no, dropped**; it could express only 3 of 7 controls and would have been the least-proven code
+    in the repo. (3) *Wait for the pipeline to settle?* — **no, and the git history says why**: over
+    the project's whole 31-day history, 22 commits touched `pipeline.py` and **exactly one** also
+    changed the emitter's input surface — 6c6e6ac, the commit that *defined* the seven-control
+    toolbox, on day two. Since 2026-07-01: **0 breaking, 4 additive, 16 zero-impact.** The
+    `generate.run(...)` call site has been byte-identical for 19 days and 11 pipeline commits,
+    through G2/H1/H2/H3/K1/K2/J4. `pipeline.py` absorbed 828 insertions in that window;
+    `agents/generate.py` absorbed 143, two of which were prompt text. H2 alone added 3,150 lines
+    repo-wide and changed the emitter contract by **zero characters**. Pipeline churn is not emitter
+    churn: the emitter binds to `Finding` + the `Control` enum + two probe dicts, and `Control` has
+    changed once, ever.
+  - **Collapsed from two backends to one emitter, and this is the finding that shaped the item.**
+    BIG-IP Advanced WAF and NGINX App Protect are the same schema family: both emit
+    `{"policy": {…}}` plus an optional `modifications` array, both draft-07, both use the same
+    kebab-case sections, 41 of NAP's 50 top-level policy properties are shared verbatim, and the
+    **`parameters` entity matches on 47 of 48 fields with identical prose descriptions**. F5 ships a
+    first-party converter (`/opt/app_protect/bin/convert-policy`) and its own Policy Supervisor
+    models XC + AWAF + NAP as three emit targets from one source policy — the architecture this item
+    was going to invent. The divergences are four parameterizable items; only `template.name`
+    touches the flagship. **Stated limit:** F5 publishes no sentence declaring them one schema, no
+    shared version, no cross-referenced `$id`. Build on "same family, NAP is close to a strict
+    subset", not on "officially one schema".
+  - **The emitted policy is MORE faithful than the XC original, which is the story worth telling.**
+    XC expresses the negative-amount rule as `body_matcher.regex_values:
+    ["amount[^0-9-]*-[0-9]"]` — a regex approximating "a minus sign near the word amount". The
+    declarative WAF policy expresses the constraint itself: `dataType: "integer"`,
+    `checkMinValue: true`, `minimumValue: 0`. Verified verbatim against the v17.1 schema. So this is
+    not "we can also emit for BIG-IP"; it is "one finding, and the emitted rule is sometimes better
+    than the one we started from".
+  - **Three traps the schema research found, each of which would have shipped a policy that blocks
+    nothing.** Every one is the G2 canary's failure mode — a band-aid that looks applied and is not.
+    - **`dataType: "integer"` does not reject `-500`.** F5 defines integer as "whole numbers only";
+      the sign rejection comes entirely from `minimumValue`.
+    - **The constraint only ALARMS unless the violation is armed.** `VIOL_PARAMETER_NUMERIC_VALUE`
+      must be set `block: true` in `policy.blocking-settings.violations`.
+    - **`parameterLocation` has no `json` value** (`[any, cookie, form-data, header, path, query]`).
+      A JSON body value is reached only via a `json-profile` with
+      `handleJsonValuesAsParameters: true`, attached through `urls[].urlContentProfiles`; the
+      extracted values then flow through the ordinary parameter engine.
+    Also killed: `isNumericValueEnforced`, `allowNegative`, `integerValue`, `decimalValue` — none
+    exist. The spellings are `exclusiveMin`/`minimumValue`, not JSON-Schema's
+    `exclusiveMinimum`/`minimum`.
+  - **Decisions.** *Flat `emitters.py`*, registry keyed like `controls.py` — H1's precedent is that a
+    package is earned when siblings share machinery, and one emitter with a target profile does not
+    earn one. *XC becomes an emitter too*, so the abstraction is proven by the backend that already
+    works and "adding a target touches nothing else" is testable on day one. *A new return type* —
+    `GeneratedArtifacts.items` carries `min_length=1`, so `unsupported` cannot be expressed as an
+    empty list. *AS3 to drive the appliance*, not iControl REST: `GET /declare` is
+    `ApplyContext.load()`'s snapshot, `action: dry-run` is `self_test()`, one POST is the attach,
+    task polling is `poll_until`, and a tenant-scoped `DELETE` gives the same hard blast-radius
+    boundary XC's namespace gives — everything lands in `/vpcopilot_lab/` and cannot reach
+    `/Common`. iControl needs 4–6 calls where AS3 needs one, with partial-failure states between and
+    no dry-run.
+  - **Open, and a first-run check on the appliance rather than a blocker:** how ASM names a
+    parameter extracted from JSON for **nested** keys — flat key or JSON-pointer path. Top-level
+    `amount` is unambiguous; nothing in F5's docs states the rule for nested objects.
+  - **Corrected:** an earlier note here assumed NGINX App Protect was free to run locally. It is
+    not — NAP v5's compose trio pulls from `private-registry.nginx.com`, which needs a client cert
+    and key from an active subscription or trial. That removed the reason to sequence NGINX first.
+  - Surfaces: `src/vpcopilot/emitters.py` (flat), `vpcopilot emit --target <name>`, and the
+    console twin per the two-surfaces invariant.
+  - Depends on **L2** for its live validation.
+
+- [x] **L2** BIG-IP lab and a copilot-owned test application. (M, P2) — **DONE:** the estate is
+  live in AWS and `vpcopilot bigip-lab create|rm|status` drives it. `bigip.py` is an AS3 client
+  (the `xc.py` shape), `bigip_lab.py` is the lab plus the tenant guard, `labs/larkspur-bank/` is the
+  origin. `GET`+`POST /api/bigip-lab` and a **BIG-IP lab** card on ⚙ Setup are the console twin.
+  Verified end to end against the real appliance. 60 tests; suite 854 → 914.
+  - **What exists** (us-east-2, all tagged `Project=vpcopilot-lab`): its own VPC `10.30.0.0/16`,
+    `vpcopilot-lab-bigip` (m5.xlarge, `ami-0161c65f0d64dff79` = *PAYG-Adv WAF Plus 25Mbps*, BIG-IP
+    17.5.1.8, **ASM `nominal`**, **AS3 3.56.0**), and `vpcopilot-lab-origin` (t3.small) running
+    Larkspur Bank in Docker. Proven live: internet → BIG-IP → origin, `HTTP 200`, and the exploit
+    lands through the appliance.
+  - **A fresh VPC, not `nimbus-demo-vpc`, and the reason is concrete.** That VPC is tagged
+    `ManagedBy=terraform` / `Project=nimbus-demo`; copilot resources inside it would fail a Nimbus
+    `terraform destroy` on a dependency violation — my lab could block *their* teardown — and would
+    be invisible drift to anyone reading `bigip.tf`. Cost: scaffolding. Benefit: neither side's
+    teardown can touch the other.
+  - **The guard is the AS3 tenant, and validation comes before it.** A tenant is a hard partition
+    (`/<tenant>/`, and a tenant-scoped DELETE cannot leave it), so it is the BIG-IP analogue of an
+    XC namespace and `VPCOPILOT_PROTECTED_BIGIP_TENANTS` the analogue of `VPCOPILOT_PROTECTED_LBS`.
+    **`/Common` is refused unconditionally** — not with `--allow-protected-tenant`, not on a dry
+    run, because previewing the deletion of the appliance's own configuration is previewing an
+    outage, and unlike every other guard here there is nothing an operator could know that would
+    make it right. Matching is **case-insensitive** (BIG-IP resolves `common` and `Common` to one
+    object) and names are validated first: `Common ` with a trailing space, `../Common`, or anything
+    carrying `/` never reaches the appliance. A `/Common` check is worth exactly as much as the
+    parsing in front of it.
+  - **The two gaps `lab-create` has, closed.** An explicit inverse, so a lab can be taken down; and
+    an audit record per mutation (`bigip_lab_create` / `bigip_lab_remove`, new category `lab`).
+    That category is deliberately not `create`/`retire`: those describe the band-aid lifecycle on a
+    load balancer serving traffic, and counting "I stood up a test appliance" beside "I mitigated a
+    finding" would inflate every number a reviewer reads. `docs/AUDIT.md`'s note that the lab
+    helpers write nothing is amended rather than left stale.
+  - **AS3 over iControl REST, as the item specified, and it earned it.** `--dry-run` uses AS3's own
+    `action: dry-run`, so the *appliance* reports what it would change rather than this code
+    guessing; a dry run writes no audit record, because nothing changed.
+  - **Three defects only the live run could find**, each now pinned by a test:
+    - **A refused guard printed a traceback and exited 0.** The guard fired correctly and then
+      reported itself as a Python error with a success code — a script or CI gate reading the exit
+      code would have been told the removal succeeded. Now `1` refused, `0` healthy, `2` usage.
+    - **`typer.Exit` subclasses `RuntimeError`**, so the `except RuntimeError` added for the fix
+      above swallowed every *successful* exit and re-reported it as a refusal: success rendering as
+      a red failure with exit 1. Invisible offline, because the tests only exercised the guard path,
+      where the two are indistinguishable.
+    - **A failed deployment reported success.** Measured against the real appliance: AS3 signals
+      failure two ways and only one is an HTTP error — a schema rejection answers `HTTP 422` with a
+      **top-level** `{code, errors}` and **no `results` array at all** (so `results[0]` is `None`
+      and the panel printed "AS3: None None"), while a per-tenant failure answers `HTTP 200` with
+      the bad code inside `results[].code`. Both now raise at the client, so no caller can forget,
+      and a failed create writes no audit record claiming a lab exists.
+  - **Found by adversarial review, before shipping** (42 raised across five failure dimensions; 6
+    distinct defects confirmed after independent skeptics tried to refute each). Four of them are
+    the same shape: *a failure that needs one fix, reported as a failure that needs a different one.*
+    - **An unreachable appliance reported as a policy refusal.** `BigIPError` subclasses
+      `RuntimeError`, which is what both surfaces caught and labelled `refused:` / HTTP 409 — so a
+      dropped SSM tunnel, the likeliest failure of a command whose management path *is* a tunnel,
+      was indistinguishable from the unoverridable `/Common` guard. A CI gate has to respond
+      oppositely to the two. New `LabRefused` for policy decisions: **exit 3** and 409, against
+      **exit 1** and 502 for the appliance or the path to it.
+    - **`status()` raised instead of answering when only `BIGIP_PASSWORD` was missing.** The Setup
+      page manages the three `BIGIP_*` keys as separate fields and sends only the ones filled in, so
+      URL-without-password is the routine half-configured state — and it tracebacked out of a CLI
+      readout and 500'd the endpoint the page polls. `BigIP()` is constructed inside the `try` now;
+      answering is the function's whole job.
+    - **A malformed `--origin` port escaped both surfaces' error handling.** `int("http")` raises
+      `ValueError`, which is not a `RuntimeError`, so the CLI printed a traceback exposing
+      `_split_origin`'s body and the console answered a bare 500 — where every other bad input on
+      that endpoint gets a message. Now a `LabRefused` naming the expected form, with the port range
+      checked too.
+    - **404, 401 and a connection error all rendered as "unreachable".** A 404 on the AS3 path is an
+      appliance that answers perfectly and has no AS3 installed — **the state every PAYG image ships
+      in, which this very lab hit**. Reporting it as unreachable sends an operator hunting a network
+      problem when the fix is a package install. `BigIPError` now carries the HTTP status and the
+      three are told apart by name.
+    - **A degraded `status()` omitted the `protected` key**, so the CLI rendered a blank list —
+      reading as "nothing is protected" rather than "we could not get that far". Every branch
+      returns the same key set now, and an unknown tenant list renders `unknown`, not `(none)`.
+    - **I had written a false claim into a code comment**, and the reviewer was right to call it:
+      `httpx` does **not** normalize `%2F` back to `/`. `URL.raw_path` correctly carries
+      `…/declare/a%2Fb`; I had read `URL.path`, the percent-*decoded* convenience property, and
+      misdiagnosed my own test failure. The encoding is real defence in depth — refusing the name is
+      still the guarantee, because what the encoding cannot decide is whether the *appliance*
+      re-splits the decoded path.
+  - **Two traps in standing the appliance up**, both recorded because they cost real time:
+    - **BIG-IP user-data runs before `mcpd` is up.** cloud-init executed the ASM provisioning at
+      ~89 s uptime, every `tmsh` call failed with *"Cannot connect to mcpd"*, cloud-init logged
+      `Failed running .../part-001` and moved on — leaving **Advanced WAF silently unprovisioned
+      while EC2 reported the instance running and status-ok**. That is G2's unenforced policy in
+      infrastructure form. Any onboarding must poll `tmsh show sys mcp-state` for `phase running`.
+    - **AS3 is not installed on the PAYG image** (only `f5-iAppLX-aws-autoscale`), so the item's
+      choice of AS3 assumed something that was not there; installed 3.56.0 from F5's release
+      channel. `scp` to the appliance also fails — the `admin` shell is tmsh, which corrupts scp's
+      protocol — so the appliance `curl`s the file itself.
+  - **Reachability is deliberately not this tool's problem.** `BIGIP_URL` is a URL and nothing here
+    knows how it resolves; in the lab, management is unpublished and reached through an SSM
+    port-forward from the origin host. Baking the tunnel in would tie the tool to one topology and
+    tempt someone into exposing a management port instead. Documented in `docs/USAGE.md §7b`.
+  - **A copilot-owned BIG-IP, not the Nimbus one.** `nimbus-demo-bigip` (us-east-2,
+    `i-0a0938f1fe2531a29`) carries a PAYG **GOOD** licence — LTM and iRules only, no ASM, per F5's
+    own Marketplace listing — so it could validate at most the iRule half of the emitter. It is also
+    another demo's front door. Stand up a separate instance on an **Advanced WAF with LTM** SKU
+    ($1.52/hr software + EC2; cost is not the deciding factor per the maintainer). Note ASM is not
+    provisioned in the base AMI — Declarative Onboarding must set `asm: nominal`, which restarts
+    daemons; budget ~10–15 min to a ready box, and 8 GiB is the memory floor for LTM+AWAF.
+  - **`vpcopilot bigip-lab create|rm`**, extending `lab.py`'s existing shape: idempotent by
+    existence, clean-slate, deterministic names from one base, and — the two gaps the XC version
+    has — an explicit inverse and an audit record. Guard by AS3 tenant the way `guard_lb` guards a
+    load balancer: a `VPCOPILOT_PROTECTED_BIGIP_TENANTS` env var and one choke point.
+  - **The test application: a small copilot-owned banking API, and the reason is not cosmetic.**
+    The flagship finding is a *numeric business-logic* flaw, and it has nowhere to run today:
+    `bench/fixtures/nimbus-vuln-lab` is **source only** (no `package.json`, no compose — scannable,
+    not runnable), and **crAPI, which IS running and IS the copilot's demo dataset, has no numeric
+    flaw at all** — its six findings are SQLi, BOLA, mass assignment, rate abuse, sensitive data and
+    broken auth. So the single strongest L1 result, the constraint that beats XC's regex, cannot be
+    demonstrated against any app the copilot currently owns.
+    - Deliberately **small**: a handful of endpoints chosen to exercise the emitter's control
+      coverage, one container, its own name and branding. **Not a Nimbus look-alike** — looking like
+      Nimbus Bank is exactly what would confuse the two demos the maintainer has just separated.
+    - It does **not** replace `bench/fixtures/nimbus-vuln-lab`. `answer_key.yaml` and
+      `bench/BASELINE.md` are calibrated against that snapshot, and re-pointing them would
+      invalidate the committed scorecard. Scan benchmark and emitter lab stay separate fixtures.
+  - **First concrete decoupling fix, and it is cheaper than any of the above.** `lab.py:48` defaults
+    to `pool_template="nimbus-bigip-pool"`, `lb_template="nimbus-www"` — the copilot builds its
+    "own" clean-slate XC lab by cloning the protected customer LB and stripping it, so `nimbus-www`
+    is simultaneously the default protected object and the default source template. Parameterise
+    both out.
 
 ---
 
@@ -638,4 +1638,6 @@ sees the trail. J1–J4 are the open `BACKLOG.md` evidence entries, scheduled; *
 - Autonomous application with no human decision.
 - A hosted or multi-tenant service.
 - Full XC policy language coverage in any offline evaluator.
-- Applying to non-XC enforcement points. `L1` generates, it does not deploy.
+- Applying to non-XC enforcement points **in production**. `L1` generates; `L2` loads the result
+  onto a lab appliance only, to prove the emitted policy actually blocks. There is no gated apply
+  path to a customer's BIG-IP or NGINX.

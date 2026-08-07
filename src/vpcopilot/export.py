@@ -22,7 +22,7 @@ from pathlib import Path
 
 from typing import Callable
 
-from . import __version__, audit, ledger, runmeta
+from . import __version__, audit, backfill, ledger, runmeta
 from .sign import sign_bytes, verify_bytes
 
 
@@ -48,6 +48,16 @@ CATEGORY = {
     # existing consumer of that action keeps working, and this one carries the extra proof (the
     # origin probe) that justified doing it without a human present.
     "escalation": "reconcile", "fix_ineffective": "reconcile", "reconcile_retire": "reconcile",
+    # J4 — bookkeeping about the trail itself rather than a change to a load balancer. Its own
+    # category, because a reviewer filtering by "what touched the tenant" should not see it, and
+    # falling through to "other" made it an unexplained row in the CSV.
+    "audit_backfill": "evidence",
+    # L2 — the BIG-IP lab. Its own category, deliberately not `create`/`retire`: those describe the
+    # band-aid lifecycle on a load balancer serving traffic, and conflating "I stood up a test
+    # appliance" with "I mitigated a finding" would inflate every count a reviewer reads. This is
+    # also the gap `lab-create` has — it mutates a tenant and writes nothing, so the trail cannot
+    # show it (docs/AUDIT.md §1).
+    "bigip_lab_create": "lab", "bigip_lab_remove": "lab",
 }
 # The XC control each action acted on, where the action name alone implies it.
 CONTROL = {
@@ -62,7 +72,8 @@ CONTROL = {
 }
 # Flat CSV columns, in reading order: when · who · what · why · where · outcome.
 COLUMNS = ["ts", "run_id", "actor", "host", "category", "action", "finding_id", "title",
-           "vuln_class", "severity", "ledger_state", "control", "lb", "namespace", "object",
+           "vuln_class", "cwe", "owasp", "cwe_source",
+           "severity", "ledger_state", "control", "lb", "namespace", "object",
            "outcome", "attempts", "exploit_before", "exploit_after", "legit_ok", "pr_url",
            "tool_version", "detail"]
 # Every artifact worth carrying as evidence. Missing ones are simply skipped — an unscanned dir has
@@ -70,7 +81,14 @@ COLUMNS = ["ts", "run_id", "actor", "host", "category", "action", "finding_id", 
 BUNDLE_FILES = ["run.json", "audit.log", "ledger.json", "findings.json", "triage.json",
                 "policies.json", "remediations.json", "summary.json", "metrics.json",
                 "probes.json", "correlations.json", "lb_snapshot.json", "simulation.json",
-                "report.html"]
+                # H2. Named `dependencies.json` and NOT `manifest.json`: `verify_bundle` locates
+                # each run in an archive by every member whose name ends `manifest.json`, so an
+                # artifact by that name would be read as a second evidence manifest.
+                "dependencies.json",
+                # J4. The attribution sidecar ships WITH the log it annotates — a
+                # reviewer who gets one without the other cannot tell a frozen
+                # attribution from an invented one.
+                "audit-backfill.json", "report.html"]
 
 
 def _rj(out: Path, name: str, default):
@@ -99,7 +117,11 @@ def _outcome(e: dict) -> str:
              # An escalation that fell through to "recorded" would read as a no-op — the exact
              # opposite of a band-aid that is now overdue and still live.
              "escalation": "escalated", "fix_ineffective": "fix_ineffective",
-             "reconcile_retire": "retired"}.get(e.get("action", ""))
+             "reconcile_retire": "retired",
+             "audit_backfill": "attributed",
+             # L2. Without these the coalescing below finds no success key at all and labels a
+             # real appliance mutation "recorded", which reads like nothing happened.
+             "bigip_lab_create": "created", "bigip_lab_remove": "removed"}.get(e.get("action", ""))
     if fixed:
         return fixed
     if e.get("unfixable"):
@@ -144,13 +166,35 @@ def build_audit_events(out_dir: str = "out") -> list[dict]:
     led = ledger.load(out_dir)
     findings = {f.get("id"): f for f in _rj(out, "findings.json", [])}
     # a policy name is often the only link back to a finding on older entries
-    by_policy = {a.get("policy_name"): a.get("finding_id") for a in _rj(out, "policies.json", [])}
+    try:
+        by_policy = ledger.policy_index(out_dir)
+    except (OSError, json.JSONDecodeError):
+        # The inline copy this replaced went through `_rj`, which swallows a damaged file. A
+        # read-only report should not explode on one; the apply paths deliberately do.
+        by_policy = {}
+    # J4 — attribution frozen by `vpcopilot audit-backfill`, keyed by entry index and already
+    # verified against this log. It WINS over `by_policy` because `policies.json` is rewritten by
+    # every scan: after a re-scan it describes a different run, and a policy name that recurs with a
+    # different finding would attribute an old entry to the wrong one. Empty until a backfill runs,
+    # so behaviour without one is unchanged.
+    frozen, sidecar_ok = backfill.load_state(out_dir)
 
     events = []
-    for e in entries:
+    for i, e in enumerate(entries):
         # `open_pr` wrote `finding` before every other action settled on `finding_id`; older logs
-        # attributed nothing at all, so fall back to the policy index.
-        fid = e.get("finding_id") or e.get("finding") or by_policy.get(e.get("policy"))
+        # attributed nothing at all, so fall back to the frozen attribution, then to the live index.
+        row = frozen.get(i)
+        fid = e.get("finding_id") or e.get("finding")
+        if not fid and row is not None:
+            # A row that says `unknown` is sticky: the backfill looked and could not establish it,
+            # so guessing from a NEWER policies.json would be inventing an answer it already
+            # declined to give.
+            fid = row.get("finding_id")
+        elif not fid and sidecar_ok:
+            fid = by_policy.get(e.get("policy"))
+        # `sidecar_ok` False means a sidecar EXISTS and will not parse: somebody froze attribution
+        # and it is now unreadable, so the live index is not the one these entries belong to.
+        # Leaving the cell blank is the honest answer; guessing produced a confidently wrong one.
         f, le = findings.get(fid, {}), (led.get(fid) or {})
         before, after = _ba(e, "before"), _ba(e, "after")
         detail = {k: v for k, v in e.items()
@@ -165,6 +209,12 @@ def build_audit_events(out_dir: str = "out") -> list[dict]:
             "finding_id": fid or "",
             "title": e.get("title") or f.get("title") or le.get("title") or "",
             "vuln_class": e.get("vuln_class") or f.get("vuln_class") or le.get("vuln_class") or "",
+            # J5 — same three-way fallback as its neighbours. `cwe_source` matters as much as
+            # `cwe`: a reviewer must be able to tell a fact the advisory stated from a
+            # classification this tool made.
+            "cwe": e.get("cwe") or f.get("cwe") or le.get("cwe") or "",
+            "owasp": e.get("owasp") or f.get("owasp") or le.get("owasp") or "",
+            "cwe_source": e.get("cwe_source") or f.get("cwe_source") or le.get("cwe_source") or "",
             "severity": e.get("severity") or f.get("severity") or le.get("severity") or "",
             "ledger_state": le.get("state", ""),
             "control": e.get("control") or CONTROL.get(e.get("action", ""), ""),
@@ -217,6 +267,19 @@ def build_manifest(out_dir: str = "out", *, members: dict | None = None) -> dict
             "simulation.json, when present, describes ONE recorded sample replayed through a spare "
             "load balancer — not production traffic in general. Its records are redacted at ingest "
             "(see `redacted`); read the window and record count with the rate.",
+            "dependencies.json, when present, is NOT a clean bill of health for the dependency "
+            "tree. Its `unpinned` list is manifest entries whose exact version could not be "
+            "established, which were therefore never queried — nothing is known about them. Its "
+            "`advisories` include entries dispositioned below_severity or capped: found and "
+            "listed, but never sent to an agent, so no band-aid was considered for them. Read "
+            "`funnel` for the counts, and note it reflects OSV.dev on the run date only.",
+            "audit-backfill.json, when present, is a DERIVED sidecar and not part of the log. It "
+            "maps audit entries to findings via the policy index as it stood when "
+            "`vpcopilot audit-backfill` ran, because that index is rewritten by every scan. It "
+            "carries no actor, run_id or host — identity comes only from audit.log, which is "
+            "append-only and shipped verbatim. A finding_id in audit.csv may therefore come from "
+            "this sidecar rather than from the entry itself; where the two ever disagree, the log "
+            "is the evidence.",
         ],
         "members": members or {},
     }

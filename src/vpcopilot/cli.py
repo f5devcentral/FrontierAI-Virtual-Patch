@@ -2,7 +2,10 @@
 writes) and drops findings, triage, policy specs, and code-fix PR drafts into ./out."""
 from __future__ import annotations
 
+import json
 import os
+import re
+from pathlib import Path
 
 import typer
 from dotenv import load_dotenv
@@ -33,7 +36,13 @@ def _root(
 
 @app.command()
 def scan(
-    repo: str = typer.Argument(..., help="path to the target application repo"),
+    repo: str = typer.Argument(None, help="path to the target application repo (omit when using --cve)"),
+    cve: str = typer.Option(None, "--cve", help="scan a security advisory instead of a repo: CVE-YYYY-NNNNN, GHSA-xxxx-xxxx-xxxx, PYSEC-YYYY-NN, GO-… or RUSTSEC-…"),
+    spec: str = typer.Option(None, "--spec", help="an OpenAPI/Swagger spec to scan for flaws IN THE CONTRACT — alone, or alongside a repo to also report spec/code drift"),
+    manifest: list[str] = typer.Option(None, "--manifest", help="a dependency manifest (requirements.txt, package-lock.json, pom.xml) to resolve against OSV — repeatable, alone or alongside a repo"),
+    min_severity: str = typer.Option("high", "--min-severity", help="--manifest: floor for reaching the resolve agent (critical|high|medium|low). Advisories below it are still listed in dependencies.json"),
+    max_advisories: int = typer.Option(25, "--max-advisories", help="--manifest: cap on advisories sent to the resolve agent (0 = no cap). What the cap held back is listed and counted, never dropped silently"),
+    include_dev: bool = typer.Option(False, "--include-dev", help="--manifest: also resolve dev/test-scoped dependencies (default: runtime only — a build-time package is not in the request path)"),
     out: str = typer.Option("out", help="output directory for findings/policies/PRs"),
     config: str = typer.Option(None, "--config", help="path to agents.yaml"),
     min_confidence: float = typer.Option(0.5, "--min-confidence", help="drop verified findings below this confidence"),
@@ -45,17 +54,84 @@ def scan(
         help="also draft the code-fix PRs (default: on; env VPCOPILOT_SCAN_REMEDIATE=0 to default off). "
              "--no-code-fixes = band-aids only, saves ~half the tokens (use for band-aid benchmarks)"),
 ):
-    """Discover -> verify -> triage -> generate policies + code-fix PRs (read-only)."""
+    """Discover -> verify -> triage -> generate policies + code-fix PRs (read-only).
+
+    With --cve the input is a security advisory instead of a repo: the advisory is resolved from
+    OSV.dev, an agent derives its HTTP exploitation profile (or says there isn't one), and the
+    result enters the same triage and generate stages.
+
+    With --manifest the input is a dependency manifest, and the same happens for every exploitable
+    advisory affecting a package it pins. Additive: pass a repo too and the code findings and the
+    dependency findings correlate together."""
+    if cve and (repo or spec or manifest):
+        raise typer.BadParameter("--cve scans one advisory; it cannot be combined with a repo, "
+                                 "--spec or --manifest")
+    if not (repo or cve or spec or manifest):
+        raise typer.BadParameter("pass a repo path, --cve, --spec, or --manifest")
+    if min_severity not in ("critical", "high", "medium", "low"):
+        raise typer.BadParameter(f"--min-severity must be critical, high, medium or low, not "
+                                 f"'{min_severity}'")
     if code_fixes is None:  # match the console default (app.py /api/defaults) so headless == UI
         code_fixes = os.environ.get("VPCOPILOT_SCAN_REMEDIATE", "1").lower() not in ("0", "false", "no")
     summary = run_pipeline(repo, out_dir=out, config_path=config, min_confidence=min_confidence,
                            concurrency=concurrency, max_files=max_files, max_bytes=max_bytes,
-                           draft_code_fixes=code_fixes,
+                           draft_code_fixes=code_fixes, advisory=cve, spec_path=spec,
+                           manifest_paths=list(manifest or []) or None, min_severity=min_severity,
+                           max_advisories=max_advisories, include_dev=include_dev,
                            log=lambda m: rprint(f"[dim]{m}[/dim]"))
     rprint(Panel.fit(
         "\n".join(f"[bold]{k}[/bold]: {v}" for k, v in summary.items()),
         title="virtual-patch-copilot",
     ))
+
+
+@app.command()
+def deps(
+    manifest: list[str] = typer.Argument(..., help="dependency manifests: requirements.txt, package-lock.json, pom.xml"),
+    min_severity: str = typer.Option("high", "--min-severity", help="floor a scan would resolve at (critical|high|medium|low)"),
+    max_advisories: int = typer.Option(25, "--max-advisories", help="cap a scan would apply (0 = no cap)"),
+    include_dev: bool = typer.Option(False, "--include-dev", help="also count dev/test-scoped dependencies"),
+    json_out: str = typer.Option(None, "--json", help="write the full report to this path"),
+    show: int = typer.Option(20, "--show", help="advisory rows to print (0 = all)"),
+):
+    """List what a --manifest scan would find, without spending a single model call.
+
+    Read-only and credential-free: it parses the manifests, asks OSV which pinned packages have
+    advisories, and prints the funnel a scan would run — including every entry it could NOT pin,
+    which is the half a dependency scanner usually leaves out."""
+    if min_severity not in ("critical", "high", "medium", "low"):
+        raise typer.BadParameter(f"--min-severity must be critical, high, medium or low, not "
+                                 f"'{min_severity}'")
+    from .inputs.deps import survey_report
+    rep = survey_report(list(manifest), min_severity=min_severity, max_advisories=max_advisories,
+                        include_dev=include_dev, log=lambda m: rprint(f"[dim]{m}[/dim]"))
+    f = rep["funnel"]
+    t = Table(title="dependency advisories")
+    for c in ["severity", "package", "installed", "advisory", "fixed", "disposition"]:
+        t.add_column(c)
+    rows = rep["advisories"] if not show else rep["advisories"][:show]
+    for a in rows:
+        t.add_row(a["severity"], a["package"], a["installed"], a["advisory_id"],
+                  a["fixed_version"] or "[yellow]none[/yellow]", a["disposition"])
+    rprint(t)
+    if show and len(rep["advisories"]) > show:
+        rprint(f"[dim]… {len(rep['advisories']) - show} more (--show 0 for all)[/dim]")
+    rprint(Panel.fit("\n".join(f"[bold]{k}[/bold]: {v}" for k, v in f.items()),
+                     title="funnel"))
+    if rep["unpinned"]:
+        # The loud half: a package whose version we could not establish was never checked, and
+        # that must not read the same way as a package that was checked and came back clean.
+        rprint(f"[yellow]{len(rep['unpinned'])} entry(ies) could not be pinned and were NOT "
+               f"checked[/yellow] — {', '.join(sorted({u['reason'] for u in rep['unpinned']}))}")
+    for u in rep.get("unchecked") or []:
+        # Flagged as having advisories, then the follow-up query failed. Unknown, not absent.
+        rprint(f"[red]could not check {u['ecosystem']}/{u['name']} {u['version']}[/red] — "
+               f"{u['error']}; its advisories are UNKNOWN, not absent")
+    for e in rep["errors"]:
+        rprint(f"[red]{e['path']}: {e['error']}[/red]")
+    if json_out:
+        Path(json_out).write_text(json.dumps(rep, indent=2))
+        rprint(f"wrote [bold]{json_out}[/bold]")
 
 
 @app.command()
@@ -158,6 +234,7 @@ def apply(
     probe_token: str = typer.Option(None, "--probe-token", help="bearer token for validation instead of user/pass (or VPCOPILOT_PROBE_TOKEN)"),
     finding: str = typer.Option(None, "--finding", help="finding id whose probe (out/probes.json) validates this policy; overrides the ledger lookup"),
     force: bool = typer.Option(False, "--force", help="apply despite the pre-apply drift check: re-attach a policy that is already attached, or push past a conflicting ALLOW on another attached policy"),
+    allow_overbroad: bool = typer.Option(False, "--allow-overbroad", help="apply despite the G2 blast-radius gate: a policy a simulation found too broad. Writes a simulate_override audit record"),
     out: str = typer.Option("out", help="output directory"),
 ):
     """Gated apply: (create from scan) -> snapshot -> self-test -> attach -> validate -> refine/rollback."""
@@ -175,10 +252,12 @@ def apply(
         from .refiner import refine_apply_service_policy
         res = refine_apply_service_policy(from_scan, lb, url, name=name, keep=keep,
                                           allow_protected=allow_protected_lb, max_refine=refine_attempts,
-                                          finding_id=finding, force=force, out_dir=out, log=logf)
+                                          finding_id=finding, force=force,
+                                          allow_overbroad=allow_overbroad, out_dir=out, log=logf)
     elif from_scan:
         from .apply import apply_from_scan
-        res = apply_from_scan(from_scan, lb, url, name=name, create_only=create_only, force=force, **kw)
+        res = apply_from_scan(from_scan, lb, url, name=name, create_only=create_only, force=force,
+                              allow_overbroad=allow_overbroad, **kw)
     else:
         from .apply import apply_service_policy
         res = apply_service_policy(lb, policy, url, **kw)
@@ -353,11 +432,19 @@ def lab_create(
     origin: str = typer.Option(..., "--origin", help="app origin host:port, e.g. 16.59.6.127:5000"),
     name: str = typer.Option(None, "--name", help="base name (default: first label of the domain)"),
     origin_tls: bool = typer.Option(False, "--origin-tls", help="origin serves HTTPS (default: HTTP)"),
+    pool_template: str = typer.Option(None, "--pool-template", help="origin pool to clone for its required XC fields (default: $VPCOPILOT_LAB_POOL_TEMPLATE)"),
+    lb_template: str = typer.Option(None, "--lb-template", help="HTTP LB to clone, then strip every security control from (default: $VPCOPILOT_LAB_LB_TEMPLATE)"),
 ):
-    """Stand up a clean-slate XC test LB for an app origin (pool + LB), then print the DNS to add."""
+    """Stand up a clean-slate XC test LB for an app origin (pool + LB), then print the DNS to add.
+
+    The lab is built by CLONING a known-good pool and LB, so every required XC field is present,
+    and then stripping the copy back to a clean slate. Which objects to clone is configuration:
+    `--pool-template` / `--lb-template`, or `$VPCOPILOT_LAB_POOL_TEMPLATE` /
+    `$VPCOPILOT_LAB_LB_TEMPLATE`. The templates are only ever READ."""
     from .lab import create_lab
 
     res = create_lab(domain, origin, name=name, origin_tls=origin_tls,
+                     pool_template=pool_template, lb_template=lb_template,
                      log=lambda m: rprint(f"[dim]{m}[/dim]"))
     rprint(Panel.fit(
         f"[bold]LB[/bold]: {res['lb']}\n[bold]pool[/bold]: {res['pool']} -> {res['origin']}\n"
@@ -374,6 +461,245 @@ def lab_create(
     rprint(f"\nOnce DNS resolves + the cert issues, scan the app and apply against [bold]{res['url']}[/bold]:")
     rprint(f"  [dim]vpcopilot scan <app-repo> --out out-{base}[/dim]")
     rprint(f"  [dim]vpcopilot apply --from-scan out-{base}/policies/<artifact>.json --lb {res['lb']} --url {res['url']} --keep[/dim]")
+
+
+@app.command()
+def emit(
+    finding: str = typer.Option(None, "--finding", help="finding id to emit for (default: every finding with a generated band-aid)"),
+    target: str = typer.Option("bigip-awaf", "--target", help="enforcement point: bigip-awaf | nginx-app-protect | xc"),
+    out: str = typer.Option("out", "--out", help="run directory to read findings, policies and probes from"),
+    output: str = typer.Option(None, "--output", help="write the emitted policy here (default: <out>/emitted/)"),
+    protocol: str = typer.Option("http", "--protocol", help="protocol of the virtual server the policy will hang off — part of the URL's identity in ASM, not a hint"),
+):
+    """L1: emit a finding's band-aid for an enforcement point other than XC.
+
+    A **declarative WAF policy**, which BIG-IP Advanced WAF and F5 WAF for NGINX (App Protect) both
+    consume — so one finding covers the XC control it already generates *and* the enforcement points
+    a customer already owns. The two differ only in `policy.template.name`.
+
+    The constraint is derived **by code** from the finding's recorded exploit and legit requests, not
+    by a model: the exploit sends a negative amount and the legit request does not, so the field, its
+    type and the bound between them are facts. Where the evidence does not establish exactly one such
+    field, it declines rather than guessing.
+
+    A control with no declarative equivalent (rate limiting, malicious-user, bot defense) reports
+    `unsupported` with a named reason and emits nothing.
+
+        vpcopilot emit --out out --target bigip-awaf
+        vpcopilot emit --out out --finding neg-pay-001 --target nginx-app-protect
+    """
+    from rich.markup import escape
+
+    from .emitters import TARGETS, EmitError
+    from .emitters import emit as emit_one
+
+    def _short(s: str, n: int = 60) -> str:
+        """Truncate only when there IS more — an unconditional ellipsis marks a short reason as
+        cut off, which is its own small lie about what the tool knows."""
+        s = str(s)
+        return s if len(s) <= n else s[:n] + "…"
+
+    if target not in TARGETS:
+        rprint(f"[red]unknown target '{target}'[/red] — known: {', '.join(sorted(TARGETS))}")
+        raise typer.Exit(2)
+
+    out_p = Path(out)
+
+    def _load(name, default):
+        """A corrupt artifact is a decline with a reason, not a traceback. `policies.json` and
+        `probes.json` are rewritten by every scan and can be caught mid-write; the J4 precedent is
+        that an unreadable index means nothing can be established, which is an answer."""
+        p = out_p / name
+        if not p.exists():
+            return default
+        try:
+            return json.loads(p.read_text())
+        except (json.JSONDecodeError, OSError) as e:
+            rprint(f"[red]cannot read {escape(str(p))}: {escape(str(e))}[/red]")
+            raise typer.Exit(1)
+
+    policies = _load("policies.json", [])
+    probes = _load("probes.json", [])
+    by_finding = {p.get("finding_id"): p for p in probes if isinstance(p, dict)}
+    if not policies:
+        rprint(f"[yellow]no policies.json in {escape(out)} — run a scan first[/yellow]")
+        raise typer.Exit(1)
+
+    rows, emitted = [], []
+    for entry in policies:
+        fid = entry.get("finding_id")
+        if finding and fid != finding:
+            continue
+        control, name = entry.get("control", ""), entry.get("policy_name", "")
+        spec_path = out_p / "policies" / f"{control}.{name}.json"
+        try:
+            spec = json.loads(spec_path.read_text()) if spec_path.exists() else None
+        except (json.JSONDecodeError, OSError):
+            spec = None      # the declarative targets do not read it; xc will decline for want of it
+        try:
+            res = emit_one(target=target, control=control, policy_name=name, spec=spec,
+                           probe=by_finding.get(fid), protocol=protocol)
+        except EmitError as e:
+            rprint(f"[red]{escape(str(e))}[/red]")
+            raise typer.Exit(1)
+        rows.append((fid, control, name, res))
+        if res.supported:
+            emitted.append(res)
+
+    if not rows:
+        rprint(f"[yellow]nothing to emit{f' for finding {escape(finding)}' if finding else ''}[/yellow]")
+        raise typer.Exit(1)
+
+    t = Table(title=f"emit → {TARGETS[target].display}")
+    for c in ("finding", "control", "policy", "emitted", "why not"):
+        t.add_column(c)
+    for fid, control, name, res in rows:
+        mark = "[green]yes[/green]" if res.supported else "[yellow]unsupported[/yellow]"
+        # EVERY cell is escaped: `policy_name` and `finding_id` are free strings a MODEL chose
+        # (schemas.py calls policy_name a "kebab-case XC object name" but nothing validates it), and
+        # Rich parses markup inside table cells. A name carrying `[` raised MarkupError, printed a
+        # traceback and wrote NOTHING — after the constraint had derived correctly.
+        t.add_row(escape(fid or ""), escape(control), escape(name), mark,
+                  "" if res.supported else escape(_short(res.reason)))
+    rprint(t)
+
+    dest = Path(output) if output else out_p / "emitted"
+    dest.mkdir(parents=True, exist_ok=True)
+    for res in emitted:
+        # `policy_name` is a free string a MODEL chose, and it is being interpolated into a
+        # filename. A name carrying `/` or `..` walks straight out of the output directory
+        # (`emitted/bigip-awaf.../../etc/x.json` resolves outside `emitted/`) — the K1 precedent,
+        # where a policy name reaching a path was refused rather than trusted.
+        safe = re.sub(r"\.{2,}", ".", re.sub(r"[^A-Za-z0-9._-]", "_", res.policy_name))
+        safe = safe.strip("._") or "policy"
+        p = dest / f"{target}.{safe}.json"
+        if not p.resolve().is_relative_to(dest.resolve()):
+            rprint(f"[red]refusing to write outside {escape(str(dest))}[/red]")
+            raise typer.Exit(1)
+        p.write_text(json.dumps(res.policy, indent=2))
+        rprint(f"[dim]wrote {escape(str(p))}[/dim]")
+        if res.reason:      # a caveat on a policy that WAS emitted (e.g. a nested parameter)
+            rprint(f"[yellow]⚠ {escape(res.reason)}[/yellow]")
+    if not emitted:
+        rprint("[yellow]nothing was emitted — every candidate declined, with a reason above[/yellow]")
+        raise typer.Exit(1)
+    rprint(f"[dim]{len(emitted)} policy(ies) → {dest}. "
+           f"Load one onto the lab appliance to prove it blocks: see docs/USAGE.md §7c[/dim]")
+
+
+@app.command(name="bigip-lab")
+def bigip_lab(
+    action: str = typer.Argument(..., help="create | rm | status"),
+    tenant: str = typer.Option("vpcopilot_lab", "--tenant", help="AS3 tenant — the blast-radius boundary; everything lands under it and nothing outside it can be touched"),
+    origin: str = typer.Option(None, "--origin", help="app origin host:port behind the appliance, e.g. 10.30.10.22:8080 (create)"),
+    virtual_address: str = typer.Option(None, "--virtual-address", help="address the virtual server listens on (create)"),
+    virtual_port: int = typer.Option(80, "--virtual-port", help="port the virtual server listens on"),
+    app_name: str = typer.Option("lab", "--app", help="AS3 application name inside the tenant"),
+    allow_protected: bool = typer.Option(False, "--allow-protected-tenant", help="mutate a tenant listed in $VPCOPILOT_PROTECTED_BIGIP_TENANTS"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="ask AS3 what it WOULD change; writes nothing"),
+    out: str = typer.Option("out", "--out", help="run directory the audit record is written to"),
+):
+    """L2: stand up (or tear down) the BIG-IP lab the declarative WAF emitter is validated against.
+
+    An HTTP virtual server in front of one origin, deliberately **clean-slate** — no WAF policy is
+    attached, because the point of the lab is to watch the copilot attach one and watch the exploit
+    stop working.
+
+    Unlike `lab-create` this has an explicit inverse and writes an audit record, which are the two
+    gaps the XC version has. The guard is the AS3 tenant: `/Common` is refused outright, and
+    anything in `$VPCOPILOT_PROTECTED_BIGIP_TENANTS` needs `--allow-protected-tenant`.
+
+        vpcopilot bigip-lab status
+        vpcopilot bigip-lab create --origin 10.30.10.22:8080 --virtual-address 10.30.10.190
+        vpcopilot bigip-lab rm --tenant vpcopilot_lab
+    """
+    from rich.markup import escape
+
+    from . import bigip_lab as lab
+    from .bigip_lab import LabRefused
+
+    # An appliance error string can contain a JSON body with brackets, which Rich reads as markup
+    # and silently drops — the J4 precedent, where the one word that mattered vanished.
+    escape_ = lambda s: escape(str(s))  # noqa: E731
+
+
+    # `escape`, because these messages legitimately contain `[dry-run]` and Rich reads that as a
+    # markup tag and silently drops it — the J4 precedent, where the one word telling an operator
+    # nothing was written was the word that vanished.
+    log = lambda m: rprint(f"[dim]{escape(str(m))}[/dim]")  # noqa: E731
+
+    if action == "status":
+        st = lab.status()
+        if not st["configured"]:
+            rprint(Panel.fit("[yellow]no BIG-IP configured[/yellow]\n"
+                             "[dim]set BIGIP_URL, BIGIP_USER and BIGIP_PASSWORD[/dim]",
+                             title="bigip-lab"))
+            raise typer.Exit()
+        if not st.get("reachable"):
+            rprint(Panel.fit(f"[red]unreachable[/red]: {escape_(st['reason'])}", title="bigip-lab"))
+            raise typer.Exit(1)
+        if st.get("as3_installed") is False or st.get("as3") is None:
+            # Reachable but unusable, which is NOT the same as unreachable and needs a different
+            # fix — every PAYG image ships without AS3, and this lab hit exactly that.
+            rprint(Panel.fit(f"[red]AS3 unavailable[/red]: {escape_(st['reason'])}",
+                             title="bigip-lab"))
+            raise typer.Exit(1)
+        # `tenants` is empty for two different reasons — genuinely none, or we could not ask — so
+        # a `reason` alongside an empty list must not read as "this appliance has no tenants".
+        tenants = ", ".join(st["tenants"]) or ("[yellow]unknown[/yellow]" if st.get("reason") else "(none)")
+        body = (f"[bold]AS3[/bold]: {st['as3']}\n"
+                f"[bold]tenants[/bold]: {tenants}\n"
+                f"[bold]protected[/bold]: {', '.join(st.get('protected') or [])}")
+        if st.get("reason"):
+            body += f"\n[yellow]{escape_(st['reason'])}[/yellow]"
+        rprint(Panel.fit(body, title="bigip-lab status"))
+        raise typer.Exit()
+
+    # A refused guard is an ANSWER, not a crash: it exits non-zero so a script or a CI gate can act
+    # on it, and it prints the reason rather than a traceback. Found by running this live — the
+    # guard fired correctly and then reported itself as a Python error with exit code 0, which is
+    # the one way a refusal can be worse than no guard at all.
+    try:
+        if action == "create":
+            if not origin or not virtual_address:
+                rprint("[red]--origin and --virtual-address are required for create[/red]")
+                raise typer.Exit(2)
+            res = lab.create(tenant, origin, virtual_address, app=app_name, virtual_port=virtual_port,
+                             allow_protected=allow_protected, dry_run=dry_run, out_dir=out, log=log)
+            title = "bigip-lab create (dry run)" if dry_run else "bigip-lab create"
+            rprint(Panel.fit(f"[bold]tenant[/bold]: {res['tenant']}\n[bold]AS3[/bold]: {res['code']} {res['message']}\n"
+                             f"[bold]URL[/bold]: {res['url']}", title=title))
+            raise typer.Exit()
+
+        if action == "rm":
+            res = lab.remove(tenant, allow_protected=allow_protected, dry_run=dry_run, out_dir=out, log=log)
+            if not res["removed"] and res.get("reason"):
+                rprint(Panel.fit(f"[yellow]{res['reason']}[/yellow]", title="bigip-lab rm"))
+                raise typer.Exit()
+            rprint(Panel.fit(f"[bold]tenant[/bold]: {res['tenant']}\n"
+                             f"{'[dim]dry run — nothing removed[/dim]' if res.get('dry_run') else '[bold]removed[/bold]'}",
+                             title="bigip-lab rm"))
+            raise typer.Exit()
+    except typer.Exit:
+        # `typer.Exit` SUBCLASSES RuntimeError, so a bare `except RuntimeError` swallows every
+        # successful exit and re-reports it as a refusal — success rendering as a red failure with
+        # exit 1. Caught and re-raised first; found by running the real create/rm cycle, because
+        # the offline tests only ever exercised the guard path, where the two are indistinguishable.
+        raise
+    except LabRefused as e:
+        # A policy decision: the tool declined. Exit 3, so a script can tell it from a transport
+        # failure — the two need opposite responses (fix the request vs retry).
+        rprint(Panel.fit(f"[red]refused[/red]: {escape(str(e))}", title=f"bigip-lab {action}"))
+        raise typer.Exit(3)
+    except RuntimeError as e:
+        # Everything else reaching here is the appliance or the path to it — an unreachable box, a
+        # dropped tunnel, missing credentials, an AS3 rejection. Labelling those "refused" told an
+        # operator the tool had declined on policy grounds when in fact nobody could reach the box.
+        rprint(Panel.fit(f"[red]appliance error[/red]: {escape(str(e))}", title=f"bigip-lab {action}"))
+        raise typer.Exit(1)
+
+    rprint(f"[red]unknown action '{action}' — expected create, rm or status[/red]")
+    raise typer.Exit(2)
 
 
 @app.command()
@@ -408,7 +734,15 @@ def xc_rm(name: str = typer.Argument(..., help="service policy name to delete"))
     from .apply import PROTECTED_POLICIES
     from .xc import XC
 
-    if name in PROTECTED_POLICIES:
+    from .engine import validate_xc_name
+    try:
+        # Parse first: the name is interpolated into the DELETE path, so `./nimbus-bizlogic-policy`
+        # sailed past this membership test and then deleted the very policy it protects.
+        name = validate_xc_name(name, "service policy")
+    except RuntimeError as e:
+        rprint(f"[red]{e}[/red]")
+        raise typer.Exit(code=1)
+    if name.lower() in {p.lower() for p in PROTECTED_POLICIES}:
         rprint(f"[red]refusing to delete protected policy '{name}'[/red]")
         raise typer.Exit(code=1)
     XC().delete_service_policy(name)
@@ -477,8 +811,7 @@ def simulate(
     """Replay a recorded traffic sample against each generated band-aid and report what it WOULD
     block, before anything reaches the gate. Read-only against the sample; the spare LB is
     snapshotted and restored."""
-    import os
-    from .simulate import DEFAULT_THRESHOLD, candidates_from_out, simulate_policies, write_result
+    from .simulate import candidates_from_out, simulate_policies, write_result
 
     cands = candidates_from_out(out, policy)
     if not cands:
@@ -493,7 +826,8 @@ def simulate(
            + (f"; redacted {sum(v for k, v in redacted.items() if not k.startswith('_'))} value(s)" if redacted else "")
            + "[/dim]")
 
-    thr = threshold if threshold is not None else float(os.environ.get("VPCOPILOT_SIM_THRESHOLD", DEFAULT_THRESHOLD))
+    from .simulate import effective_threshold
+    thr = effective_threshold(threshold)
     res = simulate_policies(cands, records, lb=lb, url=url, out_dir=out, threshold=thr,
                             max_records=max_records, source=src, window=window, redacted=redacted,
                             log=lambda m: rprint(f"[dim]{m}[/dim]"))
@@ -589,6 +923,89 @@ def export(
         rprint(f"[yellow]no audit entries in {out} — nothing has changed a load balancer yet[/yellow]")
     path = write_bundle(out, output)
     rprint(f"wrote [bold]{path}[/bold] · {len(events)} audit event(s)")
+
+
+@app.command(name="audit-backfill")
+def audit_backfill(
+    out: str = typer.Option("out", help="run directory to backfill"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="report what would be attributed, write nothing"),
+):
+    """J4: freeze the finding each audit entry belongs to, while it is still derivable.
+
+    `audit.log` is append-only and is never edited — an entry that cannot say who made a change is
+    not an audit record. This writes a sidecar, `<out>/audit-backfill.json`, that the exporter reads
+    beside the log.
+
+    Worth running before a re-scan. `policies.json` is rewritten by every scan, so the mapping from
+    a policy name back to its finding decays — and if a later scan reuses a policy name for a
+    different finding, the exporter's live lookup would attribute an old entry to the WRONG one.
+    The sidecar records what is true now, and takes precedence afterwards.
+
+    Nothing is invented: an entry whose finding cannot be established is marked `unknown`, which
+    then stops the exporter guessing. A second run changes nothing and writes nothing."""
+    from rich.markup import escape
+
+    from .backfill import backfill
+
+    # `escape`, because a log line here legitimately starts with `[dry-run]` and Rich reads that as
+    # a markup tag and silently drops it — the marker telling you nothing was written is the one
+    # word that must not vanish. (The same pattern appears in other commands; this fixes the one
+    # whose messages actually contain brackets.)
+    res = backfill(out, dry_run=dry_run, log=lambda m: rprint(f"[dim]{escape(str(m))}[/dim]"))
+    body = (f"[bold]entries needing attribution[/bold]: {res['entries']}\n"
+            f"[bold]resolved[/bold]: {res['resolved']}   "
+            f"[bold]unknown[/bold]: {res['unknown']}")
+    if res.get("stale_dropped"):
+        body += f"\n[yellow]{res['stale_dropped']} stale row(s) discarded[/yellow]"
+    if res.get("reason"):
+        body += f"\n[dim]{res['reason']} — nothing written[/dim]"
+    elif res["wrote"]:
+        body += f"\n[dim]wrote {res['path']}[/dim]"
+    rprint(Panel.fit(body, title="audit-backfill"))
+
+
+@app.command(name="audit-sink")
+def audit_sink_cmd(
+    send: bool = typer.Option(False, "--send", help="deliver one test event to the configured sink"),
+):
+    """J3: is the off-box audit sink configured, usable, and reachable?
+
+    `VPCOPILOT_AUDIT_SINK` ships every audit entry to a collector as it is written. A sink that is
+    misconfigured, or configured against a collector that is not listening, would otherwise be
+    invisible: the run succeeds either way and the only signal is one warning on stderr. This
+    reports the configuration without touching the network, and `--send` proves delivery.
+
+    The test event is not an audit record and is written to no `audit.log` — asking whether the
+    sink works must not add to the evidence it carries."""
+    from .audit_sink import check
+
+    st = check(send=send)
+    if not st["configured"]:
+        rprint(Panel.fit(f"[yellow]{st['reason']}[/yellow]\n"
+                         "[dim]set VPCOPILOT_AUDIT_SINK to https://…, syslog://…, stdout or off[/dim]",
+                         title="audit-sink"))
+        raise typer.Exit()
+    if not st["usable"]:
+        rprint(Panel.fit(f"[red]unusable[/red]: {st['reason']}", title="audit-sink"))
+        raise typer.Exit(1)
+    body = (f"[bold]kind[/bold]: {st['kind']}\n[bold]target[/bold]: {st['target']}\n"
+            f"[bold]auth token[/bold]: {'set' if st['token_set'] else 'not set'}")
+    if send:
+        if st["delivery"] == "sent":
+            body += "\n[bold]test delivery[/bold]: [green]sent[/green]"
+        elif st["delivery"] == "sent-unconfirmed":
+            # Not dressed up as success: a UDP datagram to a port with nothing bound succeeds at
+            # the send call, so this says what was actually established and what was not.
+            body += ("\n[bold]test delivery[/bold]: [yellow]sent, unconfirmed[/yellow]\n"
+                     "[dim]UDP cannot acknowledge — this proves the datagram left this host, not "
+                     "that anything received it. Check the collector.[/dim]")
+        else:
+            body += (f"\n[bold]test delivery[/bold]: [red]{st['delivery']}[/red] "
+                     f"({st['last_error'] or 'no detail'})")
+    body += "\n[dim]the local audit.log stays authoritative — a sink is a copy, never the record[/dim]"
+    rprint(Panel.fit(body, title="audit-sink"))
+    if send and not st["delivery"].startswith("sent"):
+        raise typer.Exit(1)
 
 
 @app.command(name="patches-list")
@@ -769,6 +1186,105 @@ def console(host: str = typer.Option("127.0.0.1", help="bind host"),
 
     rprint(f"[bold]ops console[/bold] → http://{host}:{port}")
     uvicorn.run("vpcopilot.console.app:app", host=host, port=port, log_level="warning")
+
+
+@app.command(name="ci-review")
+def ci_review(
+    repo: str = typer.Option(".", help="repository working tree to scan"),
+    base: str = typer.Option("origin/main", "--base", help="branch the PR targets; compared against the MERGE BASE"),
+    head: str = typer.Option("HEAD", "--head", help="branch/commit under review"),
+    out: str = typer.Option("out-ci", help="run directory for this review's artifacts"),
+    min_severity: str = typer.Option("high", "--min-severity", help="report findings at or above this (critical|high|medium|low)"),
+    min_confidence: float = typer.Option(0.5, "--min-confidence", help="drop verified findings below this confidence"),
+    max_files: int = typer.Option(40, "--max-files", help="cap on changed files scanned — a PR diff is small, and CI has a budget"),
+    max_bytes: int = typer.Option(60_000, "--max-bytes", help="cap on bytes read per file"),
+    pr_repo: str = typer.Option(None, "--pr-repo", help="GitHub slug owner/name, to post the comment"),
+    pr: int = typer.Option(None, "--pr", help="pull request number to comment on"),
+    post: bool = typer.Option(False, "--post", help="actually post/update the PR comment (needs --pr-repo and --pr)"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="with --post, render and report without calling GitHub"),
+    comment_out: str = typer.Option(None, "--comment-out", help="also write the rendered comment to this path"),
+):
+    """K2: scan a pull request's diff and comment the proposed band-aid on it.
+
+    Scans only what the branch changed, against the merge base. Never touches an F5 XC tenant: this
+    path imports no tenant client at all, so a CI job needs a GitHub token and nothing else. A
+    would-block count cannot be produced here — measuring blast radius means attaching a policy to a
+    load balancer — so the comment reports it only from a previous tenant run's `simulation.json`, and
+    otherwise says plainly that no measurement was made.
+
+    Prints the comment when `--post` is absent, so it composes in a pipeline. Exits 1 when it reports
+    at least one finding, so a workflow can choose to fail the check."""
+    from .ci import CIError, review
+
+    load_dotenv()
+    if min_severity not in ("critical", "high", "medium", "low"):
+        # Unvalidated, an unknown value fell through `SEVERITY_RANK.get(..., 1)` to `high` — and the
+        # comment then stated a threshold the run had not actually applied.
+        rprint(f"[red]--min-severity must be critical, high, medium or low (got {min_severity!r})[/red]")
+        raise typer.Exit(code=2)
+    try:
+        res = review(repo, base=base, head=head, out_dir=out, min_severity=min_severity,
+                     min_confidence=min_confidence, max_files=max_files, max_bytes=max_bytes,
+                     config_path=_active_config_path(), repo_slug=pr_repo, pr_number=pr,
+                     post=post, dry_run=dry_run, log=lambda m: rprint(f"[dim]{m}[/dim]"))
+    except CIError as e:
+        rprint(f"[red]{e}[/red]")
+        raise typer.Exit(code=2) from None
+    except Exception as e:  # noqa: BLE001
+        # EXIT 2, not 1. Exit 1 means "findings were reported" and the action reads it that way, so
+        # letting a crash exit 1 would make a review that never completed look like a completed one
+        # with findings — and the workflow would go on to publish a comment file that does not exist.
+        rprint(f"[red]ci-review failed: {type(e).__name__}: {e}[/red]")
+        raise typer.Exit(code=2) from None
+    # Written even when nothing is reported: the action's step summary reads this file, and its
+    # absence used to be rendered as "no findings at or above the threshold" — including for a diff
+    # that was never reviewed at all.
+    if comment_out and res["comment"]:
+        Path(comment_out).write_text(res["comment"])
+        rprint(f"wrote [bold]{comment_out}[/bold]")
+    rprint(Panel.fit(
+        f"[bold]changed[/bold]: {res['changed']}   [bold]scanned[/bold]: {res['scanned']}   "
+        f"[bold]reported[/bold]: {res['reported']}"
+        + (f"\n[dim]{res['reason']}[/dim]" if res.get("reason") else "")
+        + (f"\n[dim]comment {'updated' if res.get('updated') else 'created'}[/dim]"
+           if res.get("posted") else ""),
+        title="ci-review"))
+    if not post and res["reported"]:
+        print(res["comment"])
+    if res["reported"]:
+        raise typer.Exit(code=1)
+
+
+def _active_config_path() -> str | None:
+    """The config a CI run should use: whatever VPCOPILOT_CONFIG names, or the default."""
+    return os.environ.get("VPCOPILOT_CONFIG") or None
+
+
+@app.command()
+def mcp(write: bool = typer.Option(None, "--write/--no-write",
+                                   help="expose the mutating tools (apply, pr, retire, reconcile, "
+                                        "simulate). Off unless this flag or VPCOPILOT_MCP_WRITE=1. "
+                                        "They still route through the same gates as the CLI, and "
+                                        "apply/pr/retire default to a dry run")):
+    """Serve the pipeline as MCP tools over stdio, for an agent session (K1).
+
+    Read-only by default: read a finished run (scan_result, impact, patches_list, ledger), survey
+    dependencies against OSV (deps), inspect a load balancer (drift), verify an evidence bundle, and
+    start or poll a scan. The mutating tools are ABSENT from the tool list unless writes are
+    enabled — authoring the client config that enables them is the human action, exercised once, the
+    same argument `reconcile --apply` makes about the crontab.
+
+    Nothing is printed here: stdout carries the protocol and only the protocol. Progress and errors
+    go to stderr, which the MCP spec reserves for exactly that."""
+    import sys as _sys
+
+    from .mcp import serve
+    enabled = write if write is not None else \
+        os.environ.get("VPCOPILOT_MCP_WRITE", "").lower() in ("1", "true", "yes")
+    # stderr, never stdout — one stray character on stdout desynchronises the client.
+    print(f"vpcopilot mcp: serving on stdio, writes {'ENABLED' if enabled else 'off'}",
+          file=_sys.stderr, flush=True)
+    serve(enable_writes=enabled)
 
 
 def main():

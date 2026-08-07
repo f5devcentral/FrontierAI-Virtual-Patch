@@ -60,18 +60,30 @@ def _active_tag() -> str:
         return "default"
 
 SECRET_KEYS = {"ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY", "XC_API_TOKEN", "GITHUB_TOKEN",
-               "VPCOPILOT_PROBE_PASS", "VPCOPILOT_PROBE_TOKEN"}
+               "VPCOPILOT_PROBE_PASS", "VPCOPILOT_PROBE_TOKEN", "VPCOPILOT_AUDIT_SINK_TOKEN",
+               "BIGIP_PASSWORD"}
 MANAGED_KEYS = [
     "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY", "OLLAMA_API_BASE",
     "XC_API_URL", "XC_API_TOKEN", "XC_NAMESPACE", "GITHUB_TOKEN",
     # Validation auth for an auth-protected target — the probe logs in so it can demonstrate the
     # exploit (loaded before every apply via load_dotenv, so a change here takes effect next run).
     "VPCOPILOT_PROBE_USER", "VPCOPILOT_PROBE_PASS", "VPCOPILOT_PROBE_LOGIN_PATH", "VPCOPILOT_PROBE_TOKEN",
+    # J3 — off-box audit sink. The URL is NOT secret: it is echoed back so the page can show what
+    # is configured, and `audit_sink.redact` keeps the credential-bearing path out of every other
+    # surface. The bearer token is secret and lives in SECRET_KEYS above.
+    "VPCOPILOT_AUDIT_SINK", "VPCOPILOT_AUDIT_SINK_TOKEN",
+    # L2 — the BIG-IP lab appliance. The password is a credential; the URL and user are not, so
+    # the page can show what is configured.
+    "BIGIP_URL", "BIGIP_USER", "BIGIP_PASSWORD",
 ]
 
 app = FastAPI(title="virtual-patch-copilot console")
 load_dotenv(ENV_PATH)
 _scan = {"state": "idle", "log": [], "summary": None, "error": None}
+# Guards the "is a scan already running?" test-and-set. The check used to read a flag only the
+# spawned THREAD set, so two requests arriving close together both passed it and started scans
+# into the same out dir, interleaving their artifacts.
+_scan_lock = threading.Lock()
 
 LOG_MAX = 20_000  # the log endpoints serve the FULL transcript now — keep a ceiling on what one run pins in memory
 
@@ -182,6 +194,50 @@ def simulation():
     return {"out": str(OUT), "simulation": load_result(str(OUT))}
 
 
+@app.get("/api/deps")
+def dependencies():
+    """H2: the dependency funnel this run produced — every package parsed, every entry that could
+    not be pinned, and every advisory found with what became of it. Empty until a scan runs with
+    `--manifest`."""
+    p = OUT / "dependencies.json"
+    if not p.is_file():
+        return {"out": str(OUT), "dependencies": None}
+    try:
+        return {"out": str(OUT), "dependencies": json.loads(p.read_text())}
+    except (OSError, json.JSONDecodeError) as e:
+        return {"out": str(OUT), "dependencies": None, "error": str(e)}
+
+
+class DepsReq(BaseModel):
+    manifest: list[str] = []
+    min_severity: str = "high"
+    max_advisories: int = 25
+    include_dev: bool = False
+
+
+@app.post("/api/deps")
+def survey_dependencies(body: DepsReq):
+    """H2 read-only: what a `--manifest` scan WOULD find, without spending a model call.
+
+    The same module function `vpcopilot deps` calls. Synchronous rather than a background job
+    because it is parse + HTTP only — one batch query plus one query per vulnerable package — and
+    it needs no model and no credentials, so there is nothing to stream."""
+    paths = [m.strip() for m in body.manifest if m.strip()]
+    if not paths:
+        raise HTTPException(400, "give at least one manifest path")
+    if body.min_severity not in ("critical", "high", "medium", "low"):
+        raise HTTPException(400, "min_severity must be critical, high, medium or low")
+    from ..inputs.deps import survey_report
+    log: list[str] = []
+    try:
+        rep = survey_report(paths, min_severity=body.min_severity,
+                            max_advisories=body.max_advisories, include_dev=body.include_dev,
+                            log=log.append)
+    except Exception as e:  # noqa: BLE001 — a bad path is a 400, not a 500 traceback in the browser
+        raise HTTPException(400, str(e)) from e
+    return {"dependencies": rep, "log": log}
+
+
 class SimReq(BaseModel):
     logs: str | None = None            # HAR / JSONL path
     from_tenant: bool = False          # read observed requests from XC access logs
@@ -212,10 +268,9 @@ def _run_simulation(job_id: str, body: SimReq):
     job = _jobs[job_id]
     log = lambda m: _append(job["log"], m)  # noqa: E731
     try:
-        import os
 
         from ..cli import _load_traffic
-        from ..simulate import DEFAULT_THRESHOLD, candidates_from_out, simulate_policies, write_result
+        from ..simulate import candidates_from_out, simulate_policies, write_result
         cands = candidates_from_out(str(OUT), body.policy)
         if not cands:
             raise RuntimeError(f"no service_policy artifacts in {OUT} — run a scan first")
@@ -224,8 +279,8 @@ def _run_simulation(job_id: str, body: SimReq):
         if not records:
             raise RuntimeError("no records ingested — give a traffic file or enable from-tenant")
         log(f"{len(records)} record(s) from {src}")
-        thr = body.threshold if body.threshold is not None else float(
-            os.environ.get("VPCOPILOT_SIM_THRESHOLD", DEFAULT_THRESHOLD))
+        from ..simulate import effective_threshold
+        thr = effective_threshold(body.threshold)
         res = simulate_policies(cands, records, lb=body.lb, url=body.url, out_dir=str(OUT),
                                 threshold=thr, max_records=body.max_records, source=src,
                                 window=window, redacted=redacted, log=log)
@@ -304,6 +359,23 @@ def drift_ep(lb: str, control: str | None = None, policy: str | None = None,
         raise HTTPException(400, str(e))
 
 
+class BackfillReq(BaseModel):
+    dry_run: bool = False
+
+
+@app.post("/api/audit-backfill")
+def audit_backfill(body: BackfillReq | None = None):
+    """J4: freeze the finding each audit entry belongs to, into `<out>/audit-backfill.json`.
+
+    Operates on THIS run's out dir, never a caller-supplied path — the J2 precedent. POST rather
+    than GET because it writes, even though what it writes is derived rather than decided: a GET the
+    browser is free to prefetch should not append an audit record."""
+    from ..backfill import backfill
+    log: list[str] = []
+    res = backfill(str(OUT), dry_run=(body.dry_run if body else False), log=log.append)
+    return {**res, "log": log}
+
+
 @app.get("/api/audit-verify")
 def audit_verify():
     """J2: check the bundle this run last wrote (`<out>/audit-bundle.zip`) against its own manifest.
@@ -337,6 +409,7 @@ def audit_export(scope: str = "run"):
 
 
 AGENT_ROLES = {
+    "resolve": "read a security advisory → an HTTP exploitation profile (or decline)",
     "discover": "read source → candidate findings",
     "verify": "adversarially confirm or refute each finding",
     "triage": "route each finding to the strongest XC band-aid (or code-only)",
@@ -382,14 +455,67 @@ def set_model(body: ModelReq):
             "model": cfgs[body.tag]["model"]}
 
 
+# Values that are shown, but only in redacted form. Not SECRET_KEYS (which are never echoed at
+# all) — the operator needs to see WHICH sink is configured, and a blank field cannot tell them
+# that. But a sink URL routinely carries credentials: `https://user:pass@host/…` and the Splunk-HEC
+# shape `…/services/collector/<token>` both put a secret in the URL itself. `audit_sink.redact`
+# exists for exactly this and every OTHER surface already used it; `/api/config` returned the raw
+# string, so the console API handed back the basic-auth password and the HEC token in full.
+REDACTED_KEYS = {"VPCOPILOT_AUDIT_SINK"}
+
+
+def _display_value(key: str, raw: str) -> str:
+    if not raw or key not in REDACTED_KEYS:
+        return raw
+    try:
+        from ..audit_sink import redact
+        from urllib.parse import urlsplit
+        return redact(raw, (urlsplit(raw).scheme or "").lower())
+    except Exception:  # noqa: BLE001 — an unparseable sink must not 500 the settings page…
+        return "(set — unparseable, hidden)"   # …and must not fall back to showing it raw
+
+
 @app.get("/api/config")
 def get_config():
+    """Three states per key, not two: set here (.env), set in the ENVIRONMENT, or genuinely unset.
+
+    This read `.env` only, so a value supplied through the process environment — which is how the
+    documented BIG-IP setup works, and how CI and any container run — rendered as "(unset)". The
+    Setup page therefore reported `BIGIP_URL (unset)` directly above a panel that was talking to
+    the appliance over that very URL: two panels on one screen contradicting each other about
+    whether a fact was established.
+
+    It is not cosmetic. An operator who believes a credential is unset sets it, this page writes
+    .env, and the process keeps using the environment value that still wins — so the change reads
+    as applied and silently is not, on a security-relevant credential.
+    """
     env = _read_env()
-    return {
-        k: {"set": bool(env.get(k)), "secret": k in SECRET_KEYS,
-            "value": ("" if k in SECRET_KEYS else env.get(k, ""))}
-        for k in MANAGED_KEYS
-    }
+    out = {}
+    for k in MANAGED_KEYS:
+        in_file = env.get(k, "")
+        in_environ = "" if in_file else os.environ.get(k, "")
+        raw = in_file or in_environ
+        out[k] = {
+            "set": bool(raw),
+            "secret": k in SECRET_KEYS,
+            "redacted": k in REDACTED_KEYS,
+            # Where it came from, so the page can say so rather than implying .env is the only
+            # source. "" when unset — an absent source and an unknown one are not the same claim.
+            "source": "env-file" if in_file else ("environment" if in_environ else ""),
+            "value": ("" if k in SECRET_KEYS else _display_value(k, raw)),
+        }
+    return out
+
+
+def _is_redacted_echo(key: str, value: str) -> bool:
+    """True if `value` is the ellipsis form this API hands back, not a real setting.
+
+    The settings form shows the redacted sink as a PLACEHOLDER and leaves the input empty, so a
+    save cannot echo it. But a guard that lives only in the page is not a guard — the endpoint is
+    reachable directly — and writing `https://…@host/…` into .env would silently destroy a working
+    audit sink, which is the one component whose failure mode is "no record of anything".
+    """
+    return key in REDACTED_KEYS and "\u2026" in (value or "")
 
 
 class ConfigUpdate(BaseModel):
@@ -398,9 +524,151 @@ class ConfigUpdate(BaseModel):
 
 @app.post("/api/config")
 def set_config(body: ConfigUpdate):
-    _write_env(body.updates)
+    # Drop any value that is just the redacted form echoed back — see `_is_redacted_echo`.
+    # Silently ignoring it is right: it means "unchanged", exactly like a blank secret field.
+    updates = {k: v for k, v in body.updates.items() if not _is_redacted_echo(k, v)}
+    _write_env(updates)
     load_dotenv(ENV_PATH, override=True)
     return get_config()
+
+
+class EmitReq(BaseModel):
+    target: str = "bigip-awaf"
+    finding_id: str | None = None
+    protocol: str = "http"
+
+
+@app.post("/api/emit")
+def emit_policy(body: EmitReq):
+    """L1: emit the run's band-aids for another enforcement point. Read-only with respect to the
+    tenant and the appliance — it produces a document and touches nothing.
+
+    Returns every candidate including the ones that DECLINED, because "we did not emit this" and
+    "there was nothing to emit" are different answers and only one of them is a gap."""
+    from ..emitters import TARGETS, EmitError
+    from ..emitters import emit as emit_one
+    if body.target not in TARGETS:
+        raise HTTPException(400, f"unknown target '{body.target}'")
+    try:
+        policies = _rj("policies.json", [])
+        probes = {p.get("finding_id"): p for p in _rj("probes.json", []) if isinstance(p, dict)}
+    except json.JSONDecodeError as e:
+        # Both files are rewritten by every scan and can be caught mid-write. An unreadable index
+        # means nothing can be established — a 400 with the reason, not a 500 (the J4 precedent).
+        raise HTTPException(400, f"cannot read this run's artifacts: {e}")
+    results = []
+    for entry in policies:
+        fid = entry.get("finding_id")
+        if body.finding_id and fid != body.finding_id:
+            continue
+        control, name = entry.get("control", ""), entry.get("policy_name", "")
+        sp = OUT / "policies" / f"{control}.{name}.json"
+        try:
+            spec = json.loads(sp.read_text()) if sp.exists() else None
+        except (json.JSONDecodeError, OSError):
+            spec = None    # unused by the declarative targets; xc declines for want of it
+        try:
+            r = emit_one(target=body.target, control=control, policy_name=name, spec=spec,
+                         probe=probes.get(fid), protocol=body.protocol)
+        except EmitError as e:
+            raise HTTPException(400, str(e))
+        results.append({"finding_id": fid, **r.to_dict()})
+    return {"target": body.target, "display": TARGETS[body.target].display,
+            "emitted": sum(1 for r in results if r["supported"]), "results": results}
+
+
+@app.get("/api/emit-targets")
+def emit_targets():
+    """The enforcement points this build can emit for — so the console renders the list from the
+    registry rather than hardcoding it, which is what makes 'adding a target touches only the
+    emitter module' true on this surface too."""
+    from ..emitters import TARGETS
+    return {"targets": [{"key": t.key, "display": t.display, "kind": t.kind, "note": t.note}
+                        for t in TARGETS.values()]}
+
+
+@app.get("/api/bigip-lab")
+def bigip_lab_status():
+    """L2: what is on the lab appliance right now. Read-only — the Setup page polls it.
+
+    The CLI twin is `vpcopilot bigip-lab status`; both call `bigip_lab.status`, so a guard or a
+    readout cannot exist on one surface and not the other."""
+    load_dotenv(ENV_PATH, override=True)
+    from ..bigip_lab import status
+    return status()
+
+
+class BigIPLabReq(BaseModel):
+    action: str                      # create | rm
+    tenant: str = "vpcopilot_lab"
+    origin: str | None = None
+    virtual_address: str | None = None
+    virtual_port: int = 80
+    app: str = "lab"
+    allow_protected: bool = False
+    dry_run: bool = True             # the console default is a preview, like the MCP write tools
+
+
+@app.post("/api/bigip-lab")
+def bigip_lab_action(body: BigIPLabReq):
+    """Create or remove the lab tenant. Calls the same module functions the CLI calls, so it
+    inherits `guard_tenant` — including the unoverridable `/Common` refusal — rather than
+    reimplementing it."""
+    load_dotenv(ENV_PATH, override=True)
+    from ..bigip_lab import LabRefused, create, remove
+    lines: list[str] = []
+    log = lines.append
+    try:
+        if body.action == "create":
+            if not body.origin or not body.virtual_address:
+                raise HTTPException(400, "origin and virtual_address are required for create")
+            res = create(body.tenant, body.origin, body.virtual_address, app=body.app,
+                         virtual_port=body.virtual_port, allow_protected=body.allow_protected,
+                         dry_run=body.dry_run, out_dir=str(OUT), log=log)
+        elif body.action == "rm":
+            res = remove(body.tenant, allow_protected=body.allow_protected,
+                         dry_run=body.dry_run, out_dir=str(OUT), log=log)
+        else:
+            raise HTTPException(400, f"unknown action '{body.action}' — expected create or rm")
+    except HTTPException:
+        raise
+    except LabRefused as e:
+        # A refused guard is a 409, not a 500: the operator asked for something the tool declined,
+        # which is an answer rather than a fault (the drift-gate precedent).
+        raise HTTPException(409, str(e))
+    except RuntimeError as e:
+        # The appliance, or the path to it — unreachable, a dropped tunnel, missing credentials, an
+        # AS3 rejection. **502**, not 409: 409 says "we declined", and a caller that cannot tell
+        # those apart retries the wrong one. A dropped SSM tunnel is the likeliest failure here.
+        raise HTTPException(502, str(e))
+    return {**res, "log": lines}
+
+
+@app.get("/api/audit-sink")
+def audit_sink_status():
+    """J3: what the off-box audit sink is set to, and what this process has managed to deliver.
+
+    Read-only and network-free, because the Setup page polls it — the CLI twin is
+    `vpcopilot audit-sink`. The target is reported through `audit_sink.redact`, so a webhook URL
+    carrying its credential in the path is never rendered into the page."""
+    load_dotenv(ENV_PATH, override=True)
+    from ..audit_sink import status
+    return status()
+
+
+class SinkCheckReq(BaseModel):
+    send: bool = False
+
+
+@app.post("/api/audit-sink")
+def audit_sink_check(body: SinkCheckReq):
+    """Same answer, plus one test event delivered to the collector when `send` is set.
+
+    This is the only endpoint here that reaches the network, and it writes nothing: the test event
+    is not an audit record and never touches an `audit.log`."""
+    load_dotenv(ENV_PATH, override=True)
+    from ..audit_sink import check
+    return check(send=body.send)
 
 
 @app.get("/api/lbs")
@@ -589,7 +857,17 @@ def list_repos():
 
 # ---------------- scan (background) ----------------
 class ScanReq(BaseModel):
-    repo: str
+    # H1 — `str = ""` rather than `str | None`: index.html always sends `repo`, and an empty input
+    # yields "". Every existing payload stays valid and nothing can 422.
+    repo: str = ""
+    cve: str = ""
+    spec: str = ""
+    # H2 — `list[str] = []` for the same reason `cve` is `str = ""`: index.html can always send the
+    # field and an empty picker yields `[]`, so every payload written before H2 stays valid.
+    manifest: list[str] = []
+    min_severity: str = "high"
+    max_advisories: int = 25
+    include_dev: bool = False
     out: str = "out"
     min_confidence: float = 0.5
     max_files: int = 200
@@ -598,12 +876,20 @@ class ScanReq(BaseModel):
 
 
 def _run_scan(repo: str, out: str, min_confidence: float = 0.5,
-              max_files: int = 200, max_bytes: int = 60_000, draft_code_fixes: bool = True):
-    _scan.update(state="running", log=[], summary=None, error=None)
+              max_files: int = 200, max_bytes: int = 60_000, draft_code_fixes: bool = True,
+              cve: str = "", spec: str = "", manifest: list[str] | None = None,
+              min_severity: str = "high", max_advisories: int = 25, include_dev: bool = False):
+    # State is claimed by `start_scan` under `_scan_lock` before this thread exists; re-setting it
+    # here would reopen the race it closed.
     try:
         from ..pipeline import run_pipeline
-        summary = run_pipeline(repo, out_dir=out, config_path=_active_config, min_confidence=min_confidence,
-                               max_files=max_files, max_bytes=max_bytes, draft_code_fixes=draft_code_fixes,
+        summary = run_pipeline(repo or None, out_dir=out, config_path=_active_config,
+                               min_confidence=min_confidence, max_files=max_files,
+                               max_bytes=max_bytes, draft_code_fixes=draft_code_fixes,
+                               advisory=cve or None, spec_path=spec or None,
+                               manifest_paths=list(manifest or []) or None,
+                               min_severity=min_severity, max_advisories=max_advisories,
+                               include_dev=include_dev,
                                log=lambda m: _append(_scan["log"], m))
         _scan.update(state="done", summary=summary)
     except Exception as e:  # noqa: BLE001
@@ -612,18 +898,50 @@ def _run_scan(repo: str, out: str, min_confidence: float = 0.5,
 
 @app.post("/api/scan")
 def start_scan(body: ScanReq):
-    if _scan["state"] == "running":
+    if _scan["state"] == "running":      # cheap early reject; the authoritative claim is below
         raise HTTPException(409, "a scan is already running")
     load_dotenv(ENV_PATH, override=True)
     # The console reads results from OUT — so point OUT at the dir this scan writes to, or Review /
     # Mitigate would read a different (empty) dir. Makes the Output-dir field authoritative even when
     # it differs from the model-switcher default (e.g. out-claude-vampi).
+    manifests = [m.strip() for m in body.manifest if m.strip()]
+    if body.cve.strip() and (body.repo.strip() or body.spec.strip() or manifests):
+        raise HTTPException(400, "a CVE scan cannot be combined with a repo, a spec or a manifest")
+    if not (body.repo.strip() or body.cve.strip() or body.spec.strip() or manifests):
+        raise HTTPException(400, "give a repo path, a CVE/GHSA id, an OpenAPI spec, "
+                                 "or a dependency manifest")
+    if body.min_severity not in ("critical", "high", "medium", "low"):
+        raise HTTPException(400, "min_severity must be critical, high, medium or low")
+    # Claim the scanner only once the request is known to be VALID, and synchronously — before the
+    # worker thread exists. Two halves, both load-bearing:
+    #   * synchronous, under a lock: the old check read a flag only `_run_scan` set, so the window
+    #     between check and thread start was wide open and two requests both got through, writing
+    #     into the same out dir.
+    #   * after validation: claiming first meant a request that then 400'd left the scanner marked
+    #     running forever — one malformed request and the console can never scan again.
+    # On the REQUEST thread, before the worker is spawned — raising inside the pipeline would
+    # surface as a job error after this endpoint had already returned 200 "running".
+    from ..pipeline import validate_scan_inputs
+    try:
+        validate_scan_inputs(body.repo or None, body.spec or None, manifests)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from None
+    with _scan_lock:
+        if _scan["state"] == "running":
+            raise HTTPException(409, "a scan is already running")
+        _scan.update(state="running", log=[], summary=None, error=None)
     global OUT
     OUT = Path(body.out)
-    threading.Thread(target=_run_scan,
-                     args=(body.repo, body.out, body.min_confidence, body.max_files, body.max_bytes,
-                           body.draft_code_fixes),
-                     daemon=True).start()
+    # kwargs, not a positional tuple: H2/H3 add more inputs here and a positional args tuple is one
+    # reordering away from scanning the wrong thing.
+    threading.Thread(target=_run_scan, daemon=True,
+                     kwargs=dict(repo=body.repo, out=body.out, min_confidence=body.min_confidence,
+                                 max_files=body.max_files, max_bytes=body.max_bytes,
+                                 draft_code_fixes=body.draft_code_fixes, cve=body.cve,
+                                 spec=body.spec, manifest=manifests,
+                                 min_severity=body.min_severity,
+                                 max_advisories=body.max_advisories,
+                                 include_dev=body.include_dev)).start()
     return {"state": "running", "out": str(OUT)}
 
 
@@ -686,38 +1004,35 @@ class ActionReq(BaseModel):
 _jobs: dict[str, dict] = {}   # job_id -> {state, log, result, error, control, finding_id}
 
 
-def _dispatch_action(body: ActionReq, log):
+def _dispatch_action(body: ActionReq, log, out: Path):
     """Run the requested control's apply through the SAME functions the CLI uses, but with a real
-    log sink so the console can live-stream the refiner (attach → validate → refine → retry)."""
+    log sink so the console can live-stream the refiner (attach → validate → refine → retry).
+
+    `out` is passed in, never read from the module global. `OUT` is reassigned by POST /api/scan,
+    and this runs on a worker thread — so an apply already in flight used to write its artifacts
+    and its audit record into whatever directory a concurrent scan had just repointed to."""
     from .. import apply as A
     if not (body.lb or "").strip():  # fields no longer pre-fill — a missing LB must fail clearly, not as a swagger 404
         raise HTTPException(400, "select a load balancer in Run settings first")
     c, kw = body.control, dict(finding_id=body.finding_id, dry_run=body.dry_run, keep=body.keep,
-                               allow_protected=body.allow_protected_lb, out_dir=str(OUT), log=log)
+                               allow_protected=body.allow_protected_lb, out_dir=str(out), log=log)
     if c == "service_policy":
         # G2 gate: a simulated policy found too broad WARNS and requires an explicit override.
         # Silent when nothing was simulated — G2 adds a check, never a prerequisite.
-        from ..simulate import promotion_block
-        over = promotion_block(str(OUT), body.policy_name) if body.policy_name else None
-        if over and not body.dry_run:
-            if not body.allow_overbroad:
-                raise HTTPException(409, f"simulation says this policy {over.get('reason')}. "
-                                         "Re-run with 'allow overbroad' to apply it anyway.")
-            log(f"⚠ overbroad override: {over.get('reason')}")
-            from ..audit import record as _audit
-            _audit(str(OUT), "simulate_override", finding_id=body.finding_id,
-                   policy=body.policy_name, lb=body.lb, block_rate=over.get("block_rate"),
-                   threshold=over.get("threshold"), reason=over.get("reason"))
-        art = str(OUT / "policies" / f"service_policy.{body.policy_name}.json")
+        # K1 moved the check itself into `simulate.promotion_gate`, called by BOTH apply paths, so
+        # the CLI and the MCP server get it too — it used to live only here. The message and the
+        # resulting job state are unchanged: `_run_action` catches the raise and reports
+        # `state="error"` carrying the "allow overbroad" text, exactly as before.
+        art = str(out / "policies" / f"service_policy.{body.policy_name}.json")
         if body.refine and not body.dry_run:
             from ..refiner import refine_apply_service_policy
             return refine_apply_service_policy(art, body.lb, body.url, finding_id=body.finding_id,
                 name=body.policy_name, keep=body.keep, allow_protected=body.allow_protected_lb,
                 max_refine=body.refine_attempts, config_path=_active_config, force=body.force,
-                out_dir=str(OUT), log=log)
+                allow_overbroad=body.allow_overbroad, out_dir=str(out), log=log)
         return A.apply_from_scan(art, body.lb, body.url, name=body.policy_name, dry_run=body.dry_run,
             keep=body.keep, allow_protected=body.allow_protected_lb, force=body.force,
-            out_dir=str(OUT), log=log)
+            allow_overbroad=body.allow_overbroad, out_dir=str(out), log=log)
     if c == "malicious_user":
         return A.apply_malicious_user(body.lb, **kw)
     if c == "rate_limit":
@@ -743,17 +1058,17 @@ def _dispatch_action(body: ActionReq, log):
     raise HTTPException(400, f"unknown control '{c}'")
 
 
-def _run_action(job_id: str, body: ActionReq):
+def _run_action(job_id: str, body: ActionReq, out: Path):
     import time
     job = _jobs[job_id]
     t0 = time.perf_counter()
     try:
-        res = _dispatch_action(body, lambda m: _append(job["log"], m))
+        res = _dispatch_action(body, lambda m: _append(job["log"], m), out)
         job.update(state="done", result=res)
         if not body.dry_run:  # feed MTTM for the hero + a self-contained record for the model benchmark
             from ..audit import record
             passed = res.get("passed") if res.get("passed") is not None else (res.get("config_enabled") is not False)
-            record(str(OUT), "apply_timing", control=body.control, finding_id=body.finding_id,
+            record(str(out), "apply_timing", control=body.control, finding_id=body.finding_id,
                    passed=bool(passed), elapsed_s=round(time.perf_counter() - t0, 1),
                    attempts=res.get("attempts"), before_after=res.get("before_after"),
                    unfixable=res.get("unfixable"), reason=res.get("reason"), kept=res.get("kept"))
@@ -774,7 +1089,10 @@ def start_action(body: ActionReq):
     for old in list(_jobs)[:-20]:
         if _jobs.get(old, {}).get("state") != "running":
             _jobs.pop(old, None)
-    threading.Thread(target=_run_action, args=(job_id, body), daemon=True).start()
+    # Snapshot the run dir HERE, on the request thread, not inside the worker: `OUT` is a
+    # module global that POST /api/scan reassigns, so reading it later binds the apply to
+    # whichever directory happened to be current when the thread got round to it.
+    threading.Thread(target=_run_action, args=(job_id, body, OUT), daemon=True).start()
     return {"job": job_id, "state": "running"}
 
 
@@ -802,6 +1120,10 @@ class ApplyReq(BaseModel):
     refine_attempts: int | None = None
     allow_protected_lb: bool = False
     force: bool = False
+    # K1: this older endpoint is still served even though the UI now posts to /api/action. Moving the
+    # G2 gate into the module meant it started enforcing here too — and without this field there was
+    # no way to override it, turning a warn-with-audited-override into a machine veto on one surface.
+    allow_overbroad: bool = False
 
 
 @app.post("/api/apply")
@@ -814,11 +1136,13 @@ def do_apply(body: ApplyReq):
             return refine_apply_service_policy(art, body.lb, body.url, name=body.name, keep=body.keep,
                                                allow_protected=body.allow_protected_lb,
                                                max_refine=body.refine_attempts, force=body.force,
+                                               allow_overbroad=body.allow_overbroad,
                                                out_dir=str(OUT), log=lambda m: None)
         from ..apply import apply_from_scan
         return apply_from_scan(art, body.lb, body.url, name=body.name, create_only=body.create_only,
                                dry_run=body.dry_run, keep=body.keep, force=body.force,
-                               allow_protected=body.allow_protected_lb, out_dir=str(OUT),
+                               allow_protected=body.allow_protected_lb,
+                               allow_overbroad=body.allow_overbroad, out_dir=str(OUT),
                                log=lambda m: None)
     except Exception as e:  # noqa: BLE001
         raise HTTPException(400, str(e))

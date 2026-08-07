@@ -25,10 +25,17 @@ the bug, and an unattended retire. Nothing changed on the LB in most of those ca
 exactly why they belong here. "We looked and refused" and "we looked
 and overrode it anyway" are questions an auditor asks, and only the log can answer them.
 
-That scope is the whole band-aid path, but it is not literally every XC write the tool can make: the
+That scope is the whole band-aid path, but it is not literally every write the tool can make: the
 lab/teardown utilities `vpcopilot lab-create` (`lab.py`) and `vpcopilot xc-rm` (`cli.py`) mutate XC
 outside the finding lifecycle and write **no** audit record. They are setup/cleanup helpers, not
 remediation — but if you use them against a real tenant, the trail will not show it.
+
+**`vpcopilot bigip-lab` is the exception, deliberately** (L2). It mutates a BIG-IP appliance rather
+than XC, and it *does* record — `bigip_lab_create` and `bigip_lab_remove`, category `lab`. That
+category is its own rather than `create`/`retire` on purpose: those describe the band-aid lifecycle
+on a load balancer serving traffic, and counting "I stood up a test appliance" alongside "I mitigated
+a finding" would inflate every number a reviewer reads. It is the model the two XC helpers above
+should follow if they are ever revisited.
 
 **Not recorded:**
 
@@ -59,12 +66,31 @@ zip can never imply more coverage than it has:
 - The log is written by the same process that makes the change, to a local file. It is **not
   tamper-evident** — anyone who can write the out dir can edit `audit.log`. The manifest's SHA-256s
   prove a bundle was not altered *after export*; they say nothing about the authenticity of the log
-  before it. If you need tamper-evidence, ship the out dir to append-only storage.
+  before it. If you need tamper-evidence, ship the out dir to append-only storage — or set an
+  **audit event sink** (§10) so a copy of each entry leaves the box as it is written, which is the
+  cheap half of the same answer. The sink is **best-effort**: a delivered copy raises the cost of
+  editing the local log afterwards, but a *missing* one proves nothing, because the transport is
+  allowed to fail.
 - `actor` is self-asserted (`VPCOPILOT_ACTOR`, else the OS user) — it is attribution, not
   authentication.
 - Nothing in `export.py` calls XC or GitHub. The trail says what the tool *did*; the LB itself is
   the authority for what is live *now*.
 - The bundle is evidence for a human reviewer. It is not a compliance certification.
+- **`cwe` / `owasp` are a classification, not a certification claim** (J5). `cwe_source` says which
+  kind: `advisory` means the OSV record named the weakness and it is quoted; `mapped` and `evidence`
+  are the copilot's own. **A blank is not an oversight** — `CWE-840` (Business Logic Errors) is
+  PROHIBITED by MITRE for mapping because it is a Category, `CWE-200`/`CWE-287` are DISCOURAGED, and
+  Injection left the OWASP **API** Top 10 in 2023, so several classes have no honest mapping and get
+  none. A guess that looks like an answer would be worse than the gap.
+- **A blank has two meanings and the report distinguishes them.** *Declined* means the class was
+  considered and has no honest mapping — a result. *Unstamped* means the class does map, so the
+  blank is a defect: the finding predates J5 or reached the report by a path that bypassed the
+  pipeline. Reporting both as "no honest mapping exists" would state a reason the report cannot
+  know, which is the same collapse this document warns about for `unpinned` vs clean.
+- **The agent cannot write these columns.** The three fields sit on the `Finding` model the
+  `discover` agent fills, so the pipeline discards whatever it returns in them before classifying.
+  Without that, a model could put an invented CWE in the bundle under `cwe_source: advisory` — a
+  fabricated fact wearing the label reserved for quoted ones.
 
 ---
 
@@ -93,7 +119,7 @@ detail = {k: v for k, v in detail.items() if k not in _STAMPED}
 
 Everything else is per-action detail.
 
-### The 24 actions
+### The 26 actions
 
 | action | category | what it means | key detail fields |
 |---|---|---|---|
@@ -117,10 +143,12 @@ Everything else is per-action detail.
 | `apply_skipped_no_change` | gate | The policy asked for was already the attached one. Nothing was pushed — no LB PUT, no snapshot, no run artifact | `lb` `policy` |
 | `drift_block` | gate | The apply was **refused**: an ALLOW inside the policy matched the exploit before its DENY, so under FIRST_MATCH the band-aid would have attached cleanly and blocked nothing | `lb` `policy` `conflicts` |
 | `drift_override` | gate | The same conflict, applied anyway via `--force` / the console's **apply anyway**. The override is the point of the entry | `lb` `policy` `conflicts` |
-| `simulate_override` | gate | A policy that shadow simulation flagged as over-broad was promoted anyway | `finding_id` `policy` `lb` `block_rate` `threshold` `reason` |
+| `simulate_override` | gate | A policy that shadow simulation flagged as over-broad was promoted anyway. Written by `simulate.promotion_gate`, which **both** apply paths call — it used to be written only by the console, so a CLI apply neither refused nor recorded the override (K1) | `finding_id` `policy` `lb` `block_rate` `threshold` `reason` |
 | `escalation` | reconcile | A band-aid outlived its TTL with no merged cure. The control is **left in place** (`kept: true`) — an escalation is a notification, never a removal | `finding_id` `lb` `control` `policy` `cure_url` `cure_state` `applied_at` `expires_at` `ttl_hours` `age_hours` `escalation_count` `kept` `notified` `trigger` `pass_id` + denormalized `title` `vuln_class` `severity` |
 | `fix_ineffective` | reconcile | The cure PR merged, but the exploit still reproduces **at the origin** — the code fix did not work. The band-aid is held | `finding_id` `lb` `control` `policy` `cure_url` `reason` `kept` `origin_probe` `trigger` `pass_id` + denormalized finding fields |
 | `reconcile_retire` | reconcile | An unattended pass detached a band-aid after proving at origin that the exploit no longer reproduces. Written **alongside** the normal `retire` entry, not instead of it, so every existing consumer of `retire` keeps working | `finding_id` `lb` `control` `cure_url` `origin_probe` `trigger` `pass_id` |
+| `bigip_lab_create` | lab | An AS3 tenant was deployed on the lab BIG-IP (L2). Carries no `finding_id`: a lab is infrastructure, not a mitigation justified by a vulnerability | `tenant` `app` `origin` `virtual_address` `virtual_port` `code` `message` `existed` |
+| `bigip_lab_remove` | lab | That tenant, and everything under it, was removed. The explicit inverse `lab-create` never had | `tenant` `code` `message` |
 
 Notes read from the source:
 
@@ -147,7 +175,10 @@ Notes read from the source:
   given `--apply`. A report-only pass that finds an overdue patch still writes `escalation` — the
   notification is the point — but it never writes `reconcile_retire`. A pass where nothing changed
   writes nothing at all, so a nightly cron does not grow the log by N lines a night forever.
-- Every reconcile record carries `pass_id` and `trigger` (`cli` / `console` / `cron`). Cron invokes
+- Every reconcile record carries `pass_id` and `trigger` (`cli` / `console` / `cron` / `mcp`). An
+  agent session driving the MCP server (K1) records `mcp`, so the trail can say a reconcile pass came
+  from an agent rather than a person — the fact a reviewer most wants and the one the log could not
+  previously express. Cron invokes
   the CLI, so a scheduled pass is marked by exporting `VPCOPILOT_RECONCILE_TRIGGER=cron` in the
   crontab; without it a nightly pass is indistinguishable from someone typing the command. `run_id`
   cannot identify a pass — it is the identity of the out dir, and `audit.record` strips a
@@ -187,9 +218,13 @@ keeps its `run_id`, so audit entries already on disk stay joinable.
 | `repo` | absolute path of the scanned repo (`root.resolve()`) |
 | `repo_commit` / `repo_branch` / `repo_dirty` | `runmeta.git_provenance(repo)` — `git rev-parse HEAD`, `rev-parse --abbrev-ref HEAD`, `git status --porcelain`. **Fail-soft**: a target that is not a git checkout contributes none of these keys at all |
 | `config_path` | the `config/agents*.yaml` the scan ran with — **absent** when the scan used the default config (`runmeta.write_manifest` drops `None` fields) |
-| `models` | `{agent: model}` for each of `config.AGENT_NAMES` = `discover, verify, triage, generate, remediate, probe, refine` |
+| `input_kind` | what was scanned: `repo`, `spec`, `manifest`, `advisory`, or a `+`-joined combination (`repo+spec`, `repo+manifest`, `repo+spec+manifest`). `advisory` is never combined — `--cve` is exclusive |
+| `advisory` | H1 only: `{id, source, consulted, network_observable, fixed_version}` for a `--cve` scan |
+| `spec` | H3: absolute path of the OpenAPI spec, when `--spec` was given |
+| `manifests` | H2: absolute paths of the dependency manifests, when `--manifest` was given. The per-package detail is in `dependencies.json`, not here |
+| `models` | `{agent: model}` for each of `config.AGENT_NAMES` = `resolve, discover, verify, triage, generate, remediate, probe, refine` |
 | `caps` | `{min_confidence, max_files, max_bytes, draft_code_fixes}` — the limits the scan ran under |
-| `counts` | `{candidates, verified, policies, code_fix_prs}` |
+| `counts` | `{candidates, verified, policies, code_fix_prs, dependency_upgrades}`. The last two are split on `RemediationPlan.kind`: a `code_fix` is a patch drafted against a file you own and is what `pr` opens; a `dependency_upgrade` (H1/H2) is a version bump in someone else's package, so **no PR was drafted and none can be**. Counting the two together overstated the cure half of the run on every surface that renders it |
 | `started` / `finished` | UTC scan bounds |
 | `actor` / `host` / `tool_version` / `out_dir` | re-stamped on every manifest write |
 
@@ -276,6 +311,9 @@ and every config-only apply — so the exporter deliberately keeps them all.
 | `legit_ok` | did legitimate traffic still pass after the change (over-block check) |
 | `pr_url` | the cure PR — the entry's `url`, else the ledger's `cure.pr_url` |
 | `tool_version` | version that wrote the entry |
+| `cwe` | J5: the finding's CWE, e.g. `CWE-89`. **Empty is a real answer** — several vuln classes have no honest mapping (below) |
+| `owasp` | J5: OWASP **API** Security Top 10 (2023) category, e.g. `API1:2023`. Empty for the injection classes, which the 2023 list dropped |
+| `cwe_source` | J5: `advisory` (the OSV record named it — a fact), `mapped` (derived from the class — a classification), `evidence` (the recorded probe pair proves it), or empty |
 | `detail` | the whole raw entry minus the stamped keys and `action` (each already has its own column). In CSV it is JSON, so the flattening loses nothing |
 
 `finding_id` resolution: `entry.finding_id` → `entry.finding` (the legacy key `open_pr` used) →
@@ -326,6 +364,8 @@ ledger.json              found → mitigated → remediated → retired, per fin
 findings.json triage.json policies.json remediations.json
 summary.json metrics.json probes.json correlations.json
 lb_snapshot.json         the most recent pre-change LB state
+simulation.json          the blast-radius replay result, when a simulation ran (G2)
+dependencies.json        the dependency funnel, when the scan used --manifest (H2)
 report.html              the standalone HTML report
 policies/*               the exact XC configs that were pushed
 snapshots/*              per-LB timestamped pre-change state (`<lb>-<UTC>.json`)
@@ -334,6 +374,30 @@ snapshots/*              per-LB timestamped pre-change state (`<lb>-<UTC>.json`)
 Missing members are skipped, not faked — an unscanned dir has no `findings.json`, and a run with no
 live apply has no `snapshots/`. (`apply_timing` is an *entry inside* `audit.log`, not a member — a
 CLI-driven run simply has none of those lines.)
+
+**`dependencies.json` is not a clean bill of health**, and the manifest's `caveats` say so, because
+this is the member most likely to be read as one. Four things a reviewer has to know:
+
+- **`unpinned`** lists manifest entries whose exact version could not be established — a range like
+  `flask>=2.0`, an editable install, an unresolved `${property}`, a version inherited from a parent
+  POM. Those were **never queried**. Nothing is known about them; that is not the same as clean.
+  They are excluded on purpose: OSV answers a version string it cannot parse with a larger, wrong
+  advisory set rather than an error, so a guess would look like an answer.
+- **`advisories[].disposition`** distinguishes what was assessed from what was merely found.
+  `exploitable` and `declined` came back from the resolve agent. `below_severity` and `capped` were
+  found and listed but never sent to one, so no band-aid was ever considered for them —
+  `settings.min_severity` and `settings.max_advisories` record the thresholds that did it.
+  `resolve_failed` is an advisory whose agent call errored.
+- **`unchecked`** (with `funnel.packages_unchecked`) is a package OSV said has advisories and then
+  could not be asked about — a 429, a timeout, a transport error on the follow-up query. Its
+  advisories are **unknown, not absent**. Before this was its own list it appeared only as an
+  `error` key inside `packages[]`, contributing no row, no counter and no warning, which read
+  exactly like a package that came back clean.
+- **`funnel`** reconciles the counts end to end, from `packages_parsed` through to `exploitable`.
+  Note `packages_parsed` counts the entries that **were** pinned; `packages_unpinned` is a disjoint
+  list, not a subset of it, so the queried count is `packages_parsed − packages_dev_excluded`.
+  It reflects OSV.dev **on the run date only** — `run.json`'s `finished` is the as-of timestamp, and
+  re-running later will legitimately produce different numbers.
 
 `--all` produces one archive with each run under its own folder (`out-claude/`, `demo-out/`, …)
 plus a top-level `index.json` listing `{out_dir, folder, events, run_id}` per run. Run dirs are
@@ -535,7 +599,7 @@ back-fills it.
 |---|---|
 | No `run_id` / `actor` / `host` / `tool_version` | Those cells export **blank**. They are not inferred from the current environment — a guess in an audit trail is worse than a gap. |
 | `open_pr` wrote `finding`, not `finding_id` | Resolved via the `finding` key. Current builds write **both** (`pr.py`), so old and new logs read the same way. |
-| `apply_*` recorded no finding at all | Resolved through the `policies.json` index: `entry.policy` → `policy_name` → `finding_id`. Works only for entries that name a `policy`, and only while that scan's `policies.json` is still in the dir. Otherwise blank. |
+| `apply_*` recorded no finding at all | Resolved through the `policies.json` index: `entry.policy` → `policy_name` → `finding_id`. Works only for entries that name a `policy`, and only while that scan's `policies.json` is still in the dir — **`vpcopilot audit-backfill` freezes it before that expires** (§9.1). Otherwise blank. |
 | No `namespace` | Blank. The `lb` is still there; the tenant/namespace is not recoverable after the fact. |
 | No `kept` | Older entries (and any action that omits it) fall through to `passed`/`failed` rather than `kept`. Absence of `kept` is not evidence of rollback. |
 | Mixed success keys (`passed` / `config_enabled` / `enabled`) | Coalesced into one `outcome` (§5) — including the seeded demo dataset, which uses its own mix. |
@@ -549,6 +613,187 @@ cells come out blank:
 vpcopilot export --out demo/out --output /tmp/demo-evidence.zip
 ```
 
+### 9.1 Attribution backfill (J4)
+
+The `policies.json` fallback above has an expiry date, and it is easy to miss: **every scan rewrites
+`policies.json`**. Re-scan into the same out dir and the mapping from an old entry's policy name back
+to its finding is gone — the exporter quietly stops attributing those entries. Worse, if the new scan
+generates a policy with the *same name* for a *different* finding, the lookup still succeeds and
+attributes the old entry to the **wrong** finding: a confident wrong answer, in the artifact whose
+entire job is to be trustworthy.
+
+```sh
+vpcopilot audit-backfill --out out            # freeze what is derivable right now
+vpcopilot audit-backfill --out out --dry-run  # report it, write nothing
+```
+
+It writes `<out>/audit-backfill.json`, a sidecar the exporter reads beside the log, and ships it in
+the evidence bundle so a reviewer receives both together.
+
+Four properties are the whole point:
+
+- **`audit.log` is never edited.** It is append-only and `record()` strips caller-supplied identity;
+  a backfill that could rewrite an entry would destroy the property that makes the log worth keeping.
+  The only thing appended is the backfill's own `audit_backfill` record.
+- **Nothing is invented.** The sidecar carries **no `actor`, no `run_id`, no `host`** — there is
+  nowhere to put one. It maps an entry to a finding and nothing else; identity stays on the log.
+- **The frozen answer wins over the live lookup**, because after a re-scan the live index describes a
+  different run.
+- **`unknown` is sticky.** An entry the backfill looked at and could not resolve stays unresolved,
+  so a later `policies.json` cannot supply an answer the backfill already declined to give. "We
+  looked and could not establish this" is a fact worth keeping.
+
+A second run writes nothing and records nothing. That matters more than tidiness: the command appends
+its own entry, so without the check each run would see one more entry than the last, decide something
+had changed, and append again.
+
+The sidecar is keyed by the entry's index in the append-only log and verified against its
+`(ts, action)`. If the log is ever rebuilt or truncated, mismatched rows are **dropped and counted**
+rather than silently moved onto the wrong entry. It is written atomically (temp file plus rename),
+because a half-written evidence file that will not parse is worse than none.
+
+**Absent and unreadable are different answers.** No sidecar means nobody has frozen anything, so the
+exporter falls back to the live policy index as it always did. A sidecar that is present and will
+*not* parse means somebody did freeze attribution and it is now unreadable — and the live index is,
+by definition, not the one those entries belong to. The cell is left blank rather than guessed.
+
+#### What a forged sidecar could do — and what it could not
+
+The log is append-only; a sidecar is an ordinary file. So state the limit plainly rather than leave
+a reviewer to work it out.
+
+A hand-edited `audit-backfill.json` can change an entry's `finding_id`, and through it the fields
+joined *from* that id: `title`, `vuln_class`, `severity`, `ledger_state`, `pr_url`. It cannot change
+anything the log itself stamped — `ts`, `actor`, `host`, `run_id`, `action`, `outcome`, `lb`,
+`tool_version` all come straight from `audit.log` and are unreachable from the sidecar.
+
+**This adds no trust assumption that the export did not already make.** `findings.json` and
+`ledger.json` already drive exactly those joined columns, and they are the same kind of file in the
+same directory — anyone who can forge the sidecar can forge those and get the same result. The
+sidecar is digested in the bundle manifest like every other member (§6), so tampering *after* export
+is caught by `export --verify`; tampering *before* export is a question about who has write access to
+the run directory, which no artifact in it can answer.
+
+The one thing that survives all of it is the log: append-only, identity stamped centrally, and
+shipped verbatim in the bundle. If the sidecar and the log ever disagree, the log is the evidence.
+
+---
+
+## 10. Audit event sink — a copy off the box (J3)
+
+The log lives on the machine that made the change, which is the one machine an attacker who made an
+unauthorised change would want to edit. `VPCOPILOT_AUDIT_SINK` ships each entry to a collector **as
+it is written**, so the local file stops being the only copy.
+
+```sh
+VPCOPILOT_AUDIT_SINK=https://collector.example.com/ingest   # POST the entry as the body
+VPCOPILOT_AUDIT_SINK=syslog://10.0.0.9:514                  # RFC 3164 datagram over UDP
+VPCOPILOT_AUDIT_SINK=syslog:///var/run/syslog               # …or a local unix datagram socket
+VPCOPILOT_AUDIT_SINK=stdout                                 # one JSON line, for a log-scraping runtime
+VPCOPILOT_AUDIT_SINK=off                                    # deliberately disabled
+VPCOPILOT_AUDIT_SINK_TOKEN=…                                # optional: sent as `Authorization: Bearer …`
+```
+
+Both keys are on the ⚙ **Setup** page. `off` is a *value* rather than an empty box on purpose: the
+console's `.env` writer drops blank updates, so clearing the field cannot unset a key — without an
+explicit `off`, a sink switched on from the Setup page could never be switched off from it.
+
+### What it is, and what it is not
+
+**The local `audit.log` stays authoritative.** The line is appended to disk first and the sink is
+handed *the same string*, so the two cannot disagree about what happened. If the local write fails,
+nothing is delivered — an off-box event with no local counterpart could never be reconciled against
+the run it belongs to.
+
+**It never fails the run it observes.** Every delivery path returns a status and nothing raises.
+`audit.record` is called on the `rollback_failed` path, so a sink that could raise would turn *"the
+LB may be left in a changed state"* into an unrecorded event. A dead collector costs **one warning
+on stderr and one timeout**, not one per entry: after a failure the sink goes quiet for 60 s rather
+than paying the 5 s timeout again on the next record, because an apply writes several entries and
+their sum would be a real stall.
+
+**Misconfigured never renders as clean.** A value that cannot be parsed is reported as *unusable*
+with the reason, and is not silently equivalent to having no sink. This is the same distinction
+`dependencies.json` draws between `unpinned` and clean, applied to a transport. That includes values
+`urlsplit` itself refuses — a dropped bracket in an IPv6 host (`https://[2001:db8::1/x`) is the typo
+that syntax invites, and it is reported rather than raised.
+
+**A redirect is a failure, not a delivery.** The client does not follow redirects, so a `3xx` means
+the body was never re-sent: a moved ingest path, or a proxy bouncing to an SSO page, would otherwise
+swallow the whole stream while every surface read `delivered N/N`. It is refused rather than
+followed on purpose — the request carries the bearer token, and chasing a `Location` to a host you
+did not configure is how a credential travels. Point the sink at the final URL.
+
+**`sent` over UDP means "handed to the kernel".** A datagram to a port with nothing bound *succeeds*
+at the send call, so the syslog-UDP transport reports **`sent, unconfirmed`** and says why. The HTTP
+and unix-socket transports get an answer from the other end and report `sent` unqualified. This is
+the same three-state honesty as `export --verify`'s `present-unverified`: reporting "I cannot check
+this" the same way as "this worked" would destroy the distinction that matters most.
+
+**A sink is a copy, not a second source of truth.** It attests nothing on its own: the collector
+receives what this tool sent, exactly as the local log records what this tool did. Where the two
+disagree, they disagree about *delivery*, and the bundle ships the log.
+
+**What the collector receives.** The entry verbatim — the same JSON, including `actor`, `host`,
+`run_id` and every per-action detail field. There is no envelope and no `out_dir`: a filesystem
+path is not something to put on the wire (the J1 precedent, where the signature's trusted comment
+leaked the exporter's absolute path), and `run_id` is already the join key. Read §2 for what those
+details contain before pointing this at a collector outside your network.
+
+### Checking it
+
+A sink that is configured and silently not delivering is the failure this feature has to make
+visible, because the run succeeds either way:
+
+```sh
+vpcopilot audit-sink            # configuration only — no network
+vpcopilot audit-sink --send     # deliver one test event; exits non-zero if it does not land
+```
+
+The Setup page has the same readout and a **Send test event** button (`GET`/`POST /api/audit-sink`).
+The test event is deliberately **not** shaped like an audit entry — it carries `kind:
+"vpcopilot-audit-sink-test"` where a real entry carries `action`, so a collector alerting on actions
+cannot be tripped by a connectivity check — and it is written to no `audit.log`: asking whether the
+sink works must not add to the evidence it carries.
+
+Delivery counters (`attempted` / `delivered` / `failed` / `suppressed`) are **per process**. A
+one-shot CLI apply reports its own run; a long-lived console or MCP session accumulates. A CLI run
+that failed said so on stderr, and there is nowhere else it could have been recorded — writing a
+delivery record into `audit.log` would recurse, and an entry-count-changing side effect is the bug
+J4's no-op check exists to prevent.
+
+### Syslog size, measured
+
+A syslog datagram has a hard size limit and the kernel enforces it by **refusing the write**
+(`EMSGSIZE`) — measured at 2048 bytes on a macOS `/var/run/syslog` unix socket and around 9216 for
+UDP; a Linux `/dev/log` is far larger. The entries that overflow are the interesting ones, because
+`drift_detected` carries a whole field-level diff. So nothing is hardcoded: the full entry is sent,
+and *only* if the kernel refuses it is a reduced envelope sent instead —
+
+```json
+{"ts":"…","action":"drift_detected","run_id":"…","actor":"…","finding_id":"…",
+ "audit_sink_oversize":true,"bytes":4213,
+ "note":"entry too large for one syslog datagram — the full record is in the run's audit.log"}
+```
+
+— valid JSON that says an entry happened, identifies it, and says it did not fit, rather than a
+dropped record or a truncated fragment. Note also that a *remote* receiver may impose its own
+smaller limit (RFC 3164 only requires 1024 bytes to be accepted); the HTTP sink has no such ceiling.
+
+The syslog header timestamp is local time, because the RFC says so — it is the transport's clock.
+The authoritative one is `ts` **inside** the JSON, which is UTC.
+
+### One more thing worth knowing
+
+The sink is process-global and reads its configuration from the environment on every entry, so a
+Setup-page save takes effect on the next record with no restart.
+
+The test suite is immune to that by construction rather than by convention: `tests/conftest.py`
+clears both variables in an autouse fixture. It has to, because most of the suite exercises
+`audit.record` — with the variable exported, one full run shipped **267 fabricated audit records**
+(`apply_waf`, `retire`, `rollback_failed`) to the collector, where nothing distinguishes them from
+records of real changes to a load balancer.
+
 ---
 
 ## See also
@@ -556,6 +801,8 @@ vpcopilot export --out demo/out --output /tmp/demo-evidence.zip
 - `docs/USAGE.md` — the full apply / PR / retire workflow
 - `DESIGN.md` — where the audit sink sits in the architecture
 - `src/vpcopilot/export.py` — `COLUMNS`, `CATEGORY`, `CONTROL`, `BUNDLE_FILES`
+- `src/vpcopilot/audit_sink.py` — the off-box sink (§10)
 - Tests: `tests/test_audit_provenance.py` (what every entry must carry),
   `tests/test_export.py` (normalization, CSV, bundle, multi-run),
-  `tests/test_console_audit_export.py` (the endpoints)
+  `tests/test_console_audit_export.py` (the endpoints),
+  `tests/test_audit_sink.py` (the sink: fail-soft, redaction, transports, size)

@@ -47,7 +47,12 @@ def save(out_dir, entries: dict):
     POSIX/Windows) so a crash mid-write can't leave a truncated, unparseable ledger."""
     p = _path(out_dir)
     p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_suffix(f".json.tmp.{os.getpid()}")
+    # Thread id as well as pid. Two threads in ONE process shared this path, so the second
+    # `os.replace` raised FileNotFoundError — the identical defect `runmeta._save` was fixed
+    # for, left behind here. The console starts every apply on its own daemon thread and
+    # `mark_mitigated` runs inside them, so the loser silently fails to record a change it
+    # already made to a live load balancer.
+    tmp = p.with_suffix(f".json.tmp.{os.getpid()}.{threading.get_ident()}")
     tmp.write_text(json.dumps(entries, indent=2))
     os.replace(tmp, p)
 
@@ -78,6 +83,10 @@ def _init_from_scan(out_dir, findings: list[dict], decisions: list[dict],
         e.update({
             "finding_id": fid, "file": f.get("file"), "vuln_class": f.get("vuln_class"),
             "severity": f.get("severity"), "title": f.get("title"),
+            # J5 — carried like vuln_class/severity, because the ledger outlives findings.json
+            # (every scan rewrites it) and an escalation read months later needs the taxonomy.
+            "cwe": f.get("cwe", ""), "owasp": f.get("owasp", ""),
+            "cwe_source": f.get("cwe_source", ""),
             "bandaids": [b["control"] for b in d.get("bandaids", [])],
             "no_bandaid": d.get("no_bandaid", False),
             "has_cure": fid in has_cure,
@@ -165,12 +174,44 @@ def mark_retired(out_dir, finding_id: str) -> dict:
         return e
 
 
-def find_finding_for_policy(out_dir, policy_name: str) -> str | None:
-    """Map a generated policy back to its finding via the scan's policies.json index."""
+def policy_index(out_dir) -> dict[str, str]:
+    """`{policy_name: finding_id}` from the scan's `policies.json`.
+
+    THE one place this lookup lives. It had grown a second copy in `export.build_audit_events`,
+    which built the same dict inline; J4 would have made a third. Two copies of a mapping is one
+    copy that eventually stops matching.
+
+    **This index is rewritten by every scan** (`pipeline._write_out`), so it describes the LATEST
+    run and not the run an old audit entry belongs to. That is what J4's sidecar exists to freeze —
+    see `backfill.py`.
+
+    Semantics are the OLD `find_finding_for_policy`'s, exactly, because four apply-path callers
+    depend on them and a consolidation that quietly changes behaviour is worse than the duplication
+    it removes. Three differences were measured against the previous implementation and all three
+    are deliberately preserved here:
+
+    - **First match wins.** A dict comprehension would let a later duplicate overwrite an earlier
+      one. `policies.json` should not contain duplicate names, but "should not" is not "does not",
+      and silently changing which finding an apply validates against is not a refactor.
+    - **A falsy `finding_id` is returned as-is**, not filtered out. Callers all write
+      `finding_id or find_finding_for_policy(...)`, so `""` and `None` behave identically to them —
+      but the *backfill* wants them treated as unresolved, and that belongs at its call site rather
+      than in a lookup four other paths share.
+    - **A corrupt file raises**, as it did before. The apply paths use this to decide which probe
+      validates a band-aid; proceeding with no finding because the index would not parse means
+      applying with weaker validation and no explanation. `export` catches it instead, because a
+      read-only report should not explode on a damaged artifact."""
     p = Path(out_dir) / "policies.json"
     if not p.exists():
-        return None
+        return {}
+    idx: dict[str, str] = {}
     for a in json.loads(p.read_text()):
-        if a.get("policy_name") == policy_name:
-            return a.get("finding_id")
-    return None
+        name = a.get("policy_name")
+        if name is not None and name not in idx:
+            idx[name] = a.get("finding_id")
+    return idx
+
+
+def find_finding_for_policy(out_dir, policy_name: str) -> str | None:
+    """Map a generated policy back to its finding via the scan's policies.json index."""
+    return policy_index(out_dir).get(policy_name)

@@ -34,7 +34,10 @@ dependencies = [
 deploy = ["PyGithub>=2.3"]
 # Ops console (localhost web UI).
 console = ["fastapi>=0.110", "uvicorn>=0.29"]
-dev = ["pytest>=8.0", "pytest-cov>=5.0", "ruff>=0.5"]
+# `jsonschema` validates the L1 emitter's output against the vendored BIG-IP / NGINX App Protect
+# schemas. It was already present transitively via litellm; declared here so the L1 test cannot be
+# broken by an unrelated dependency bump.
+dev = ["pytest>=8.0", "pytest-cov>=5.0", "ruff>=0.5", "jsonschema>=4.0"]
 
 [project.urls]
 Homepage = "https://github.com/henleda/virtual-patch-copilot"
@@ -50,7 +53,12 @@ packages = ["src/vpcopilot"]
 "src/vpcopilot/console/static/index.html" = "vpcopilot/console/static/index.html"
 
 [tool.pytest.ini_options]
-pythonpath = ["src"]
+# "." so `tests.live` (the live-suite harness) imports the same way however pytest is invoked.
+# `python -m pytest` puts the CWD on sys.path and bare `pytest` does not, so without this the
+# suite passed locally and failed in CI with `ModuleNotFoundError: No module named 'tests'` —
+# `tests` was resolving as an implicit namespace package off the CWD. pytest applies `pythonpath`
+# itself, so it holds for both invocations.
+pythonpath = ["src", "."]
 markers = [
   "live: hits a real XC tenant / model / network — excluded from CI (run manually / nightly)",
   "bench: runs the discovery benchmark — excluded from the fast CI job (has its own gate)",
