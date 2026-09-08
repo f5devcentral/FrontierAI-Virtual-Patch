@@ -84,9 +84,11 @@ for ttl, sub, y in OUT:
     o.append(text(1104, y + 46, sub, size=10.5, fill=GREY))
 
 # ================================================================ the three verbs
-VERBS = [(RED, 400, "apply", "gated by a human · snapshot first · rollback on failure"),
-         (OK, 660, "validate", "re-fire the finding's own exploit at the live policy"),
-         (GREY, 920, "retire", "the cure merged — detach the band-aid, close the ledger")]
+# Sub-labels are kept short on purpose: at 10px they sit ~250px apart, and a longer string
+# runs into the next verb's label so the three read as one sentence.
+VERBS = [(RED, 400, "apply", "human-gated · snapshots first"),
+         (OK, 660, "validate", "re-fires the finding's own exploit"),
+         (GREY, 920, "retire", "the cure merged — detach, close the ledger")]
 for col, x, ttl, sub in VERBS:
     o.append(path(f"M{x} 392 L{x} 452", stroke=col, sw=2,
                   marker="ar-red" if col == RED else ("ar-ok" if col == OK else "ar")))

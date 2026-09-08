@@ -15,6 +15,22 @@ Regenerate (no dependencies beyond the standard library):
 cd docs/images/src && python3 flow_hero.py && python3 flow_pipeline.py && python3 flow_control_plane.py
 ```
 
+## PNG copies
+
+Each diagram also ships as a PNG beside its SVG. **The SVG is the source of truth** and is what
+`README.md` and `DESIGN.md` embed — GitHub scales it crisply at any width, and it stays a few tens
+of kilobytes. The PNGs are for everywhere that will not take an SVG: PowerPoint and Keynote,
+LinkedIn and other social cards, Substack and most email clients, and anything headed for print.
+
+```bash
+python3 docs/images/src/render_png.py             # 2x — a full-bleed slide
+python3 docs/images/src/render_png.py --scale 3   # 3x — print, or a poster crop
+```
+
+**Re-run it after regenerating any SVG**, or the PNG silently goes stale. It needs the same
+headless Chromium as the screenshot script below. The diagrams carry an explicit white background
+rect, so the PNGs are opaque white rather than transparent — which is what you want on a slide.
+
 `svgkit.py` holds the shared primitives and the palette. Two constraints are deliberate and
 worth keeping:
 
