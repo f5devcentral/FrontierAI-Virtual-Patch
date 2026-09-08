@@ -6,11 +6,9 @@ expansion. `run_pipeline` calls this at the end so every scan drops an HTML dash
 `vpcopilot report` (re)builds it from an existing out dir."""
 from __future__ import annotations
 
-import base64
 import html
 import json
 from datetime import datetime, timezone
-from functools import lru_cache
 from pathlib import Path
 
 # The agents named in the report's model table. One of the FOUR places a new agent must be
@@ -22,14 +20,18 @@ REPORTED_AGENTS = ("resolve", "discover", "verify", "triage", "generate", "remed
 SEV_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3}
 
 
-@lru_cache(maxsize=1)
-def _f5_logo_uri() -> str:
-    """The F5 mark, inlined as a data URI so the report stays a single self-contained file."""
-    p = Path(__file__).parent / "console" / "static" / "f5-logo.png"
-    try:
-        return "data:image/png;base64," + base64.b64encode(p.read_bytes()).decode("ascii")
-    except OSError:
-        return ""
+# The product mark, inlined as SVG so the report stays a single self-contained file with no
+# external resource loads (see tests/test_report.py).
+_MARK = (
+    '<span class="logo" aria-hidden="true">'
+    '<svg viewBox="0 0 24 24" fill="none">'
+    '<path d="M12 1.9 4 4.9v6.3c0 5.1 3.3 9 8 10.5 4.7-1.5 8-5.4 8-10.5V4.9L12 1.9Z" '
+    'stroke="#fff" stroke-width="1.6" stroke-linejoin="round"/>'
+    '<rect x="6.2" y="10.1" width="11.6" height="4.4" rx="2.2" '
+    'transform="rotate(-38 12 12.3)" fill="#e4002b"/>'
+    '<circle cx="12" cy="12.3" r="1.05" fill="#fff"/>'
+    '</svg></span>'
+)
 
 
 _CSS = """
@@ -38,8 +40,8 @@ _CSS = """
 *{box-sizing:border-box}
 body{margin:0;font:14px/1.5 "Aptos","Aptos Display",-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;color:var(--ink);background:var(--bg)}
 header{background:var(--navy);color:#fff;padding:14px 28px;border-bottom:3px solid var(--f5);display:flex;align-items:center;gap:12px}
-header .logo{background:#fff;border-radius:8px;padding:5px;width:38px;height:38px;flex:0 0 auto}
-header .logo img{width:100%;height:100%;object-fit:contain;display:block}
+header .logo{width:32px;height:32px;flex:0 0 auto;display:flex}
+header .logo svg{width:100%;height:100%;display:block}
 header h1{font-size:18px;margin:0;font-weight:800;letter-spacing:-.01em}header .dot{color:var(--f5)}
 header .sub{color:#cfccce;font-size:13px;margin-top:4px}
 main{padding:24px;max-width:1100px;margin:0 auto}
@@ -668,12 +670,10 @@ def build_report(out_dir: str = "out") -> str:
     except Exception:  # noqa: BLE001
         im = {}
 
-    _luri = _f5_logo_uri()
-    _logo = f'<span class="logo"><img src="{_luri}" alt="F5"/></span>' if _luri else ""
     return f"""<!doctype html><html lang="en"><head><meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>virtual-patch-copilot · report</title><style>{_CSS}</style></head><body>
-<header>{_logo}<div class="htext"><h1>virtual-patch<span class="dot">·</span>copilot <span style="font-weight:400">— scan report</span></h1>
+<header>{_MARK}<div class="htext"><h1>virtual-patch<span class="dot">·</span>copilot <span style="font-weight:400">— scan report</span></h1>
 <div class="sub">{target} · generated {_e(ts)}</div></div></header>
 <main>
 {_hero_html(im)}
