@@ -8,8 +8,8 @@ Give bring-your-own-BIG-IP customers the same closed loop XC has —
 **mitigate → validate → refine → keep/rollback → retire** — so the copilot doesn't just *emit a policy for*
 your BIG-IP, it *applies and proves* the patch on your BIG-IP and manages its lifecycle.
 
-Today (0.2.0) BIG-IP is two things: `emit --target bigip-awaf` (produces a declarative WAF policy **document**,
-read-only) and `bigip-lab` (a **validation lab** that stands up a clean-slate AS3 tenant). Neither is the
+When this spec was written (0.2.0) BIG-IP was two things: `emit --target bigip-awaf` (produces a declarative WAF policy **document**,
+read-only) and `bigip-lab` (a **validation lab** that stands up a clean-slate AS3 tenant). Neither was the
 production apply loop. This spec closes that gap.
 
 The encouraging finding from a code audit: **most of the spine already exists and is reusable**. Four

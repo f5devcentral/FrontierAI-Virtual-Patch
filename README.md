@@ -4,6 +4,8 @@
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 ![Python](https://img.shields.io/badge/python-3.10%E2%80%933.12-blue.svg)
 
+[![Find the vulnerability, mitigate it live on the F5 proxy you already run, ship the code fix, retire the band-aid](docs/images/flow-hero.svg)](docs/images/flow-pipeline.svg)
+
 An agent pipeline that **finds application vulnerabilities, mitigates each live with the right
 F5 Distributed Cloud (XC) control, and drafts the real code fix** — so the exposure window
 between "AI found a vuln" and "the code fix ships" collapses from weeks to minutes, with a human
@@ -38,14 +40,9 @@ on Claude, OpenAI, Gemini, or local Ollama — per agent or globally — with no
 
 ## How it works
 
-```
-repo ─▶ discover ─▶ verify ─▶ triage ─▶ generate ─┬▶ apply  (XC band-aid: snapshot → self-test →
-        (find)    (refute)  (route)   (XC config) │         attach → validate → refine → keep/rollback)
-                                       remediate  └▶ open PR (the real code fix — the cure)
-                                                        │
-                          ledger: found → mitigated → remediated → retire (detach the band-aid)
-                          audit:  every mutating step, appended and exportable as evidence
-```
+[![Scan input feeds eight agents, which find and verify a vulnerability, pick the control, write the band-aid and prove it blocks — then apply it to F5 Distributed Cloud, F5 WAF for NGINX or BIG-IP Advanced WAF and retire it once the code fix lands](docs/images/flow-pipeline.svg)](docs/images/flow-pipeline.svg)
+
+<sub>Click through for the full-size diagram. It is generated — see [`docs/images/src/`](docs/images/src/).</sub>
 
 - **discover → verify** find candidates and adversarially refute the weak ones (calibrated,
   severity-weighted confidence gate; each distinct vuln reported once, with its effective endpoint).
@@ -107,7 +104,7 @@ reference: **[docs/USAGE.md](docs/USAGE.md)**.
 
 ## The console
 
-An **F5-branded**, guided flow that follows the lifecycle — a persistent hero band (N exploitable →
+A guided flow that follows the lifecycle — a persistent hero band (N exploitable →
 mitigated live in seconds vs. change-control days) sits on top of six steps:
 
 1. **Scan** — point at a repo (a CVE, dependency manifests, or an OpenAPI spec live under *Other
@@ -155,7 +152,7 @@ for.
 
 ![Retire step — ledger and audit trail](docs/images/6-retire.png)
 
-Every scan also drops a standalone, shareable **`report.html`** — same F5 branding, the same hero,
+Every scan also drops a standalone, shareable **`report.html`** — the same look, the same hero,
 the at-a-glance bars (severity, XC control, and the OWASP-API grouping), pipeline metrics, and —
 further down — per-finding band-aid coverage with the self-heal (`200 → 403`, *self-healed ×2*) and
 the ledger:

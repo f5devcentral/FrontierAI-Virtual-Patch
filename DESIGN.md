@@ -12,6 +12,8 @@ negative-amount transfer flaw → decide "service policy" → write the spec →
 
 `virtual-patch-copilot` is the **product**; Nimbus is the first dogfood example.
 
+![An agent control plane over the F5 data plane: eight agents turn scan input into a band-aid policy, a code-fix PR, a ledger and signed evidence, then apply, validate and retire that policy on the proxy already sitting in front of the origin](docs/images/flow-control-plane.svg)
+
 ## Mandatory requirements (locked)
 1. **Its own repo** — `henleda/virtual-patch-copilot`.
 2. **Band-aids, not cures** — service-policy / malicious-user mitigations are temporary;
