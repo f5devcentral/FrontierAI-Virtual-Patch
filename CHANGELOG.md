@@ -32,7 +32,8 @@ points, every form proven against a real exploit on real appliances.
 ### Changed
 - **The F5 logo is gone from every UI surface** — the console header and the standalone HTML
   report now carry a neutral product mark instead. The report stays a single self-contained file
-  with no external resource loads; the mark is inline SVG rather than an embedded PNG.
+  with no external resource loads; the mark is inline SVG rather than an embedded PNG. Every
+  documentation screenshot that showed the old header was re-captured.
 - Honest declines are surfaced, not hidden: where a control has no declarative-WAF equivalent
   (`rate_limit`, `malicious_user`, `bot_defense`) or cannot work as a virtual patch (`waf` — ASM
   and App Protect both hold freshly-imported signatures in staging), the console and the report
