@@ -12,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from vpcopilot import ledger, reconcile
+from vpcopilot import inventory, ledger, reconcile
 
 T0 = datetime(2026, 7, 29, 12, 0, tzinfo=timezone.utc)
 EXPLOIT = {"method": "POST", "path": "/users/v1/register"}
@@ -73,6 +73,13 @@ def _actions(tmp_path):
 def _run(tmp_path, **kw):
     kw.setdefault("log", lambda m: None)
     return reconcile.reconcile(str(tmp_path), **kw)
+
+
+def _inv(fid="f1", lb="lab"):
+    """A live band-aid's inventory entry — reconcile now records its observations + retire state in
+    the global inventory (not the session ledger), so post-pass assertions read from here. Keyed by
+    (lb, finding_id); _seed defaults lb='lab'."""
+    return inventory.get(fid, lb)
 
 
 # ---- TTL, stamped where every apply path already passes ----
@@ -215,7 +222,7 @@ def test_escalation_repeats_after_the_renotify_interval(tmp_path, monkeypatch):
     _run(tmp_path, now=_at(0))
     r2 = _run(tmp_path, now=_at(200))        # past the 168h default re-notify
     assert r2["escalations"] == 1
-    assert ledger.load(str(tmp_path))["f1"]["reconcile"]["escalation_count"] == 2
+    assert _inv()["reconcile"]["escalation_count"] == 2
 
 
 def test_a_merged_cure_never_escalates_however_old(tmp_path, monkeypatch):
@@ -281,6 +288,96 @@ def test_apply_retires_a_proven_fix(tmp_path, monkeypatch, fake_xc):
     assert "retire" in _actions(tmp_path)      # the existing action too, so old consumers still work
 
 
+def test_apply_retires_a_bigip_bandaid_on_the_appliance_not_via_xc(tmp_path, monkeypatch):
+    """A reconciled BIG-IP AWAF band-aid (control `bigip_awaf`) detaches on the appliance via
+    retire_bigip — tenant/app recovered from the ledger's mitigation.lb — NOT through the XC PUT.
+    A bring-your-own-BIG-IP user has no XC at all, so the XC-only presence checks must be skipped."""
+    monkeypatch.setenv(reconcile.TARGETS_ENV, "vpcopilot_lab/lab=http://origin.test")
+    _seed(tmp_path, control="bigip_awaf", lb="vpcopilot_lab/lab")
+    _probes(tmp_path)
+    _no_github(monkeypatch, "merged")
+    _healthy(monkeypatch)
+    _fake_probe(monkeypatch, {"exploit_status": 200, "exploit_blocked": True, "legit_ok": True})
+    # a BIG-IP-only user has no XC — constructing it raises, and reconcile must tolerate that
+    monkeypatch.setattr("vpcopilot.xc.XC", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no XC")))
+    seen = {}
+
+    def fake_retire(finding_id, *, tenant, app, out_dir, allow_protected, log):
+        seen.update(finding_id=finding_id, tenant=tenant, app=app)
+        ledger.mark_retired(out_dir, finding_id)               # the real retire_bigip does this
+        return {"retired": True, "finding_id": finding_id, "tenant": tenant, "app": app}
+
+    monkeypatch.setattr("vpcopilot.bigip_apply.retire_bigip", fake_retire)
+    monkeypatch.setattr("vpcopilot.retire.retire_finding",
+                        lambda *a, **k: pytest.fail("routed a BIG-IP band-aid to the XC detach"))
+    r = _run(tmp_path, apply=True, now=_at(0))
+    assert r["retired"] == 1
+    assert seen == {"finding_id": "f1", "tenant": "vpcopilot_lab", "app": "lab"}  # recovered from the ledger lb
+    assert ledger.load(str(tmp_path))["f1"]["state"] == "retired"
+    assert "reconcile_retire" in _actions(tmp_path)
+
+
+def test_apply_retires_a_nginx_bandaid_on_the_box_not_via_xc(tmp_path, monkeypatch):
+    """A reconciled NGINX App Protect band-aid (control `nginx_app_protect`) detaches on the box via
+    retire_nginx — server/location recovered from the ledger's mitigation.lb — NOT through the XC PUT,
+    for the same reason as BIG-IP: a bring-your-own-NGINX user has no XC at all."""
+    monkeypatch.setenv(reconcile.TARGETS_ENV, "vpcopilot.lab/=http://origin.test")
+    _seed(tmp_path, control="nginx_app_protect", lb="vpcopilot.lab/")
+    _probes(tmp_path)
+    _no_github(monkeypatch, "merged")
+    _healthy(monkeypatch)
+    _fake_probe(monkeypatch, {"exploit_status": 200, "exploit_blocked": True, "legit_ok": True})
+    monkeypatch.setattr("vpcopilot.xc.XC", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no XC")))
+    seen = {}
+
+    def fake_retire(finding_id, *, server, location, out_dir, allow_protected, log):
+        seen.update(finding_id=finding_id, server=server, location=location)
+        ledger.mark_retired(out_dir, finding_id)               # the real retire_nginx does this
+        return {"retired": True, "finding_id": finding_id, "server": server, "location": location}
+
+    monkeypatch.setattr("vpcopilot.nginx_apply.retire_nginx", fake_retire)
+    monkeypatch.setattr("vpcopilot.retire.retire_finding",
+                        lambda *a, **k: pytest.fail("routed a NGINX band-aid to the XC detach"))
+    r = _run(tmp_path, apply=True, now=_at(0))
+    assert r["retired"] == 1
+    assert seen == {"finding_id": "f1", "server": "vpcopilot.lab", "location": "/"}  # recovered from the lb
+    assert ledger.load(str(tmp_path))["f1"]["state"] == "retired"
+    assert "reconcile_retire" in _actions(tmp_path)
+
+
+def test_a_data_guard_leak_probe_reconciles_without_a_legit_leg(tmp_path, monkeypatch):
+    """A response-masking (`waf_data_guard`) finding's probe has a `leak` request and NO `exploit` or
+    `legit` leg. TWO gates must let it through and BOTH are exercised for real here — that is the point
+    of patching `probe_from_spec` rather than `_probe` wholesale (an earlier version of this test
+    patched `_probe`, which skipped `_probe`'s own fireable-precondition and hid a bug where a
+    leak-only spec short-circuited to `{}` and held at `skipped_no_probe`, never reaching the leak
+    exemption). With both fixed, a proven origin fix must auto-retire."""
+    monkeypatch.setenv(reconcile.TARGETS_ENV, "vpcopilot_lab/lab=http://origin.test")
+    _seed(tmp_path, control="bigip_awaf", lb="vpcopilot_lab/lab")
+    (tmp_path / "probes.json").write_text(json.dumps(
+        [{"finding_id": "f1", "leak": {"method": "GET", "path": "/api/profile"},
+          "leak_secrets": ["4111111111111111"]}]))
+    _no_github(monkeypatch, "merged")
+    _healthy(monkeypatch)
+    seen = {}
+
+    def fake_pfs(target_url, probe, log=None, auth=None):
+        seen["spec"] = probe        # the REAL _probe let a leak-only spec through to probe_from_spec
+        # origin fixed: leak observed (200), no secret present -> masked/blocked True, legit_ok True
+        return {"exploit_status": 200, "exploit_blocked": True, "legit_ok": True,
+                "leak": True, "leak_observed": True}
+
+    monkeypatch.setattr("vpcopilot.probe.probe_from_spec", fake_pfs)   # NOT reconcile._probe
+    monkeypatch.setattr("vpcopilot.xc.XC", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no XC")))
+    monkeypatch.setattr("vpcopilot.bigip_apply.retire_bigip",
+                        lambda finding_id, **k: {"retired": True, "finding_id": finding_id})
+    r = _run(tmp_path, apply=True, now=_at(0))
+    assert seen.get("spec", {}).get("leak"), "_probe must reach probe_from_spec with the leak spec"
+    assert r["retired"] == 1                    # not held at skipped_no_probe / skipped_no_legit_baseline
+    outcomes = [a for a in r["actions"] if a["finding_id"] == "f1"]
+    assert outcomes and outcomes[0]["outcome"] == "retired"
+
+
 def test_a_control_already_gone_is_marked_retired_without_a_put(tmp_path, monkeypatch, fake_xc):
     """Someone retired it by hand. Detach would still PUT `no_service_policies` and claim a
     removal that did not happen."""
@@ -293,6 +390,9 @@ def test_a_control_already_gone_is_marked_retired_without_a_put(tmp_path, monkey
     monkeypatch.setattr("vpcopilot.xc.XC", lambda *a, **k: fake_xc)
     r = _run(tmp_path, apply=True, now=_at(0))
     assert r["retired"] == 1 and fake_xc.put_lb_calls == []
+    assert _inv()["state"] == "retired"
+    # the applying session's own track is advanced too (not just the inventory), so impact()'s
+    # per-session hero — which reads the session ledger — stops counting this detached band-aid as live.
     assert ledger.load(str(tmp_path))["f1"]["state"] == "retired"
 
 
@@ -421,7 +521,9 @@ def test_reconcile_builds_its_own_auth_to_avoid_a_nightly_login_storm(monkeypatc
 def test_a_second_pass_exits_cleanly_instead_of_piling_up(tmp_path, monkeypatch):
     _seed(tmp_path)
     _no_github(monkeypatch, "open")
-    with reconcile.PassLock(str(tmp_path)):
+    # The pass-lock is global now (it guards the shared inventory, not a session dir), so a competing
+    # pass is simulated by holding the lock at the inventory dir.
+    with reconcile.PassLock(str(inventory.inventory_dir())):
         r = _run(tmp_path, now=_at(0))
     assert r["lock"] == "busy" and r["checked"] == 0
 
@@ -544,14 +646,18 @@ def test_patches_list_fires_nothing(tmp_path, monkeypatch):
 
 # ---- no regressions ----
 def test_a_rescan_no_longer_orphans_a_live_bandaid(tmp_path):
-    """The old pruning deleted any entry absent from the new triage — including one whose control
-    was still attached, stranding it where reconcile could never find it."""
-    _seed(tmp_path, fid="old-finding", state="mitigated")
+    """The old pruning KEPT a still-live entry in the session ledger to avoid orphaning it — which is
+    exactly what bled a prior app's 5-day-old mitigation into a later scan's Retire view. Now the
+    session ledger is scoped strictly to this scan, and the live band-aid is preserved in the global
+    inventory instead, where reconcile + Retire still find it. Not orphaned, not mixed."""
+    ledger.mark_mitigated(str(tmp_path), "old-finding", control="service_policy",
+                          policy_name="deny-x", lb="lab")     # applied -> session ledger + inventory
     ledger.init_from_scan(str(tmp_path), [{"id": "new-1"}],
                           [{"finding_id": "new-1", "bandaids": []}], [])
-    entries = ledger.load(str(tmp_path))
-    assert set(entries) == {"old-finding", "new-1"}
-    assert entries["old-finding"]["mitigation"]["lb"] == "lab"
+    # the session ledger holds ONLY this scan's findings — the old one is gone from it
+    assert set(ledger.load(str(tmp_path))) == {"new-1"}
+    # but the live band-aid is not orphaned: the inventory still carries it, retire-able as ever
+    assert inventory.get("old-finding", "lab")["mitigation"]["lb"] == "lab"
 
 
 def test_a_rescan_still_drops_a_finding_with_no_live_bandaid(tmp_path):
@@ -574,8 +680,8 @@ def test_reconcile_records_are_data_not_a_state_change(tmp_path, monkeypatch):
     _seed(tmp_path, applied_h=-200, state="mitigated", cure=None)
     _no_github(monkeypatch, "none")
     _run(tmp_path, now=_at(0))
-    e = ledger.load(str(tmp_path))["f1"]
-    assert e["state"] == "mitigated"
+    e = _inv()
+    assert e["state"] == "mitigated"                     # recording an observation is not a state change
     assert e["reconcile"]["outcome"] == "escalated"
 
 
@@ -630,8 +736,8 @@ def test_the_apps_own_block_still_retires(tmp_path, monkeypatch, fake_xc):
 
 def test_an_origin_that_is_the_lbs_own_domain_is_detectable():
     from vpcopilot.reconcile import origin_is_an_lb
-    lb = {"spec": {"domains": ["crapi.banknimbus.com"]}}
-    assert origin_is_an_lb("https://crapi.banknimbus.com", lb) is True
+    lb = {"spec": {"domains": ["crapi.example.com"]}}
+    assert origin_is_an_lb("https://crapi.example.com", lb) is True
     assert origin_is_an_lb("http://10.0.0.5:8888", lb) is False
 
 
@@ -693,9 +799,9 @@ def test_a_transient_ok_never_erases_a_standing_verdict(tmp_path, monkeypatch):
     _healthy(monkeypatch)
     _fake_probe(monkeypatch, {"exploit_status": 200, "exploit_blocked": False, "legit_ok": True})
     _run(tmp_path, now=_at(0))
-    assert ledger.load(str(tmp_path))["f1"]["reconcile"]["outcome"] == "fix_ineffective"
+    assert _inv()["reconcile"]["outcome"] == "fix_ineffective"
     _run(tmp_path, now=_at(2))          # inside the cooldown -> "ok"
-    rec = ledger.load(str(tmp_path))["f1"]["reconcile"]
+    rec = _inv()["reconcile"]
     assert rec["outcome"] == "fix_ineffective" and "cooling down" in rec["transient"]
 
 

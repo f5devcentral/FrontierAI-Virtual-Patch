@@ -19,14 +19,31 @@ REPORTED_AGENTS = ("resolve", "discover", "verify", "triage", "generate", "remed
 
 SEV_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3}
 
+
+# The product mark, inlined as SVG so the report stays a single self-contained file with no
+# external resource loads (see tests/test_report.py).
+_MARK = (
+    '<span class="logo" aria-hidden="true">'
+    '<svg viewBox="0 0 24 24" fill="none">'
+    '<path d="M12 1.9 4 4.9v6.3c0 5.1 3.3 9 8 10.5 4.7-1.5 8-5.4 8-10.5V4.9L12 1.9Z" '
+    'stroke="#fff" stroke-width="1.6" stroke-linejoin="round"/>'
+    '<rect x="6.2" y="10.1" width="11.6" height="4.4" rx="2.2" '
+    'transform="rotate(-38 12 12.3)" fill="#e4002b"/>'
+    '<circle cx="12" cy="12.3" r="1.05" fill="#fff"/>'
+    '</svg></span>'
+)
+
+
 _CSS = """
-:root{--ink:#121624;--navy:#1b2a4a;--f5:#e4002b;--grey:#6a7282;--line:#dfe4ee;
- --ok:#167c3a;--amber:#b45a00;--bg:#f6f8fc}
+:root{--ink:#17181c;--navy:#111317;--f5:#e4002b;--grey:#6a7282;--line:#e4e2e6;
+ --ok:#009639;--amber:#b45a00;--bg:#f5f5f7}
 *{box-sizing:border-box}
-body{margin:0;font:14px/1.5 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:var(--ink);background:var(--bg)}
-header{background:var(--navy);color:#fff;padding:18px 28px}
-header h1{font-size:18px;margin:0;font-weight:700}header .dot{color:var(--f5)}
-header .sub{color:#c7d2e8;font-size:13px;margin-top:4px}
+body{margin:0;font:14px/1.5 "Aptos","Aptos Display",-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;color:var(--ink);background:var(--bg)}
+header{background:var(--navy);color:#fff;padding:14px 28px;border-bottom:3px solid var(--f5);display:flex;align-items:center;gap:12px}
+header .logo{width:32px;height:32px;flex:0 0 auto;display:flex}
+header .logo svg{width:100%;height:100%;display:block}
+header h1{font-size:18px;margin:0;font-weight:800;letter-spacing:-.01em}header .dot{color:var(--f5)}
+header .sub{color:#cfccce;font-size:13px;margin-top:4px}
 main{padding:24px;max-width:1100px;margin:0 auto}
 h2{font-size:15px;margin:26px 0 12px}
 .chips{display:flex;gap:10px;flex-wrap:wrap}
@@ -48,10 +65,10 @@ h2{font-size:15px;margin:26px 0 12px}
 .nob{background:#fff4ec;border-color:#f0c9a6;color:var(--amber);font-weight:700}
 .cure{margin-left:auto;color:var(--ok);font-weight:700;font-size:12px}
 .resid{color:var(--amber);font-size:12px;margin-top:8px}
-details{margin-top:10px}details summary{cursor:pointer;color:#1b4fa1;font-size:13px;font-weight:600}
+details{margin-top:10px}details summary{cursor:pointer;color:#0e41aa;font-size:13px;font-weight:600}
 details .body{margin-top:8px;font-size:13px}
 details .body p{margin:6px 0}details .body .k{color:var(--grey);font-weight:600}
-pre{background:#0f1422;color:#d7e0f2;padding:12px;border-radius:8px;overflow:auto;font-size:12px;white-space:pre-wrap;margin:8px 0 0}
+pre{background:#16171b;color:#e2e0e3;padding:12px;border-radius:8px;overflow:auto;font-size:12px;white-space:pre-wrap;margin:8px 0 0}
 table{width:100%;border-collapse:collapse;background:#fff;border:1px solid var(--line);border-radius:10px;overflow:hidden}
 th,td{text-align:left;padding:8px 12px;border-bottom:1px solid var(--line);font-size:13px}
 th{color:var(--grey);font-weight:600;background:var(--bg)}
@@ -59,12 +76,12 @@ th{color:var(--grey);font-weight:600;background:var(--bg)}
 .st-found{color:var(--grey)}.st-mitigated{color:var(--amber);font-weight:700}
 .st-remediated{color:var(--ok);font-weight:700}.st-retired{color:#1b4fa1;font-weight:700}
 footer{color:var(--grey);font-size:12px;padding:20px 28px;text-align:center}
-.hero{background:linear-gradient(120deg,#1b2a4a,#25406e);color:#fff;border-radius:12px;
+.hero{background:linear-gradient(120deg,#111317,#2a2c31);color:#fff;border-radius:12px;border-left:4px solid var(--f5);
  padding:20px 22px;display:flex;gap:14px;align-items:center;flex-wrap:wrap;margin:0 0 8px}
 .hero .h{text-align:center;min-width:96px}.hero .h.dim{opacity:.72}
 .hero .h .n{font-size:28px;font-weight:800;line-height:1.05;display:block}
-.hero .h .l{font-size:11px;color:#c7d2e8;margin-top:2px}
-.hero .sep{font-size:20px;font-weight:800;color:#7f93bd}.hero .red{color:#ff98a8}
+.hero .h .l{font-size:11px;color:#cfccce;margin-top:2px}
+.hero .sep{font-size:20px;font-weight:800;color:#5a5c61}.hero .red{color:#ff8a99}
 .badge{display:inline-block;background:#e7f5ec;color:var(--ok);border:1px solid #bfe3cc;
  border-radius:20px;padding:0 8px;font-size:11px;font-weight:700}
 .bars{display:flex;gap:24px;flex-wrap:wrap}.bars .grp{flex:1;min-width:240px}
@@ -166,10 +183,17 @@ def _impact_cell(x: dict) -> str:
 
 def _impact_rows(audits: list) -> str:
     label = {"apply_service_policy": "service_policy", "refine_apply": "service_policy",
-             "apply_waf": "waf", "apply_api_schema": "api_schema", "apply_rate_limit": "rate_limit"}
+             "apply_waf": "waf", "apply_api_schema": "api_schema", "apply_rate_limit": "rate_limit",
+             "apply_bigip_awaf": "BIG-IP Advanced WAF",
+             "apply_nginx_app_protect": "F5 WAF for NGINX (App Protect)"}
     rows = ""
     for a in audits or []:
         ba, beh = a.get("before_after"), a.get("behavioral")
+        # Tolerate the legacy [before, after] list an older BIG-IP apply wrote (bigip_apply.py now
+        # writes the {"before":…,"after":…} dict every other apply uses) — a report built over an
+        # audit log recorded before that fix must still render, not raise `list.get`.
+        if isinstance(ba, list):
+            ba = {"before": ba[0], "after": ba[1]} if len(ba) == 2 else None
         ctrl = label.get(a.get("action"), a.get("action", ""))
         when = _e(str(a.get("ts", ""))[:19])
         # C5: surface the self-heal — a policy that only worked after the refine loop retried it
@@ -179,7 +203,8 @@ def _impact_rows(audits: list) -> str:
                   else '<span class="st-mitigated">fail</span>')
         if ba:  # exploit before/after (service_policy / waf / api_schema)
             b, af = ba.get("before", {}), ba.get("after", {})
-            tgt = a.get("policy") or a.get("app_firewall") or a.get("apidef") or ""
+            tgt = (a.get("policy") or a.get("app_firewall") or a.get("apidef")
+                   or a.get("policy_name") or "")   # policy_name: a BIG-IP AWAF apply record
             legit = "ok" if af.get("legit_ok") else "—"
             rows += (f'<tr><td>{_e(ctrl)}{heal}</td><td class="file">{_e(tgt)}</td>'
                      f'<td>{_impact_cell(b)}</td><td>{_impact_cell(af)}</td>'
@@ -219,26 +244,27 @@ def _hero_html(im: dict) -> str:
         return ""
     mttm = f"{im['mttm_seconds']}s" if im.get("mttm_seconds") is not None else "minutes"
     speed = f" · {im['speedup']:,}× faster" if im.get("speedup") else ""
+    # Name where the band-aids actually landed (XC / BIG-IP / NGINX) rather than always saying "by XC".
+    points = im.get("points_live") or []
+    where = " · " + ", ".join(points) if points else ""
     h = lambda n, lbl, dim="": f'<div class="h{dim}"><span class="n">{_e(n)}</span><span class="l">{_e(lbl)}</span></div>'  # noqa: E731
-    from .impact import xc_dashboard_url
-    dash = xc_dashboard_url()
-    dash_link = (f'<a href="{_e(dash)}" target="_blank" style="margin-left:auto;color:#fff;font-weight:700;font-size:12px">'
-                 'XC security dashboard ↗</a>') if dash else ""
+    # The change-control contrast is a narrative baseline, not a number from this scan — render it only
+    # when the operator opted in (CHANGE_CONTROL_DAYS set, so impact() returns a non-null value).
+    contrast = (f'<span class="sep">vs</span>'
+                f'<div class="h dim"><span class="n red">{_e(im["change_control_days"])} days</span>'
+                '<span class="l">normal change control</span></div>') if im.get("change_control_days") else ""
     return ('<div class="hero">'
             + h(im["vulns"], "exploitable vulns")
             + '<span class="sep">→</span>'
-            + h(im["mitigated"], "mitigated live by XC")
+            + h(im["mitigated"], "mitigated live" + where)
             + h(mttm, "time to mitigate" + speed)
-            + '<span class="sep">vs</span>'
-            + f'<div class="h dim"><span class="n red">{_e(im["change_control_days"])} days</span>'
-              '<span class="l">normal change control</span></div>'
+            + contrast
             + h(im["code_prs"], "code-fix PRs (the cure)")
             # H2: an advisory's cure is an upgrade in someone else's package — no PR was drafted
             # and none can be. Shown beside the PR count, never folded into it. Omitted entirely
             # when there are none, so a repo-only report is unchanged.
             + (h(im["dependency_upgrades"], "upgrades to ship (no PR)")
                if im.get("dependency_upgrades") else "")
-            + dash_link
             + '</div>')
 
 
@@ -297,7 +323,7 @@ def _bars_html(findings: list, summary: dict) -> str:
         return f'<div class="grp"><div class="h" style="font-weight:700;font-size:13px;margin-bottom:4px">{title}</div>{bars or "<span class=cls>none</span>"}</div>'
 
     sev = _grp("Findings by severity", {k: sev_c[k] for k in SEV_ORDER}, lambda k: sev_col.get(k, "#6a7282"))
-    ctrl = _grp("Band-aids by XC control", ctrl_c, lambda k: "#1b2a4a")
+    ctrl = _grp("Band-aids by XC control", ctrl_c, lambda k: "#111317")
 
     # J5 — group by OWASP API Top 10 category. The residual bar is every finding WITHOUT a
     # category, which is not the same set as `unclassified` (no CWE *and* no OWASP): an sqli
@@ -313,7 +339,7 @@ def _bars_html(findings: list, summary: dict) -> str:
         owasp_c["(no category)"] = no_cat
     assert sum(owasp_c.values()) == ws["total"], "the OWASP chart does not account for every finding"
     owasp = _grp("Findings by OWASP API Top 10", owasp_c,
-                 lambda k: "#6a7282" if k.startswith("(") else "#4b57b8")
+                 lambda k: "#6a7282" if k.startswith("(") else "#0e41aa")
     return f'<h2>At a glance</h2><div class="bars">{sev}{ctrl}{owasp}</div>{_weakness_note(ws)}'
 
 
@@ -411,7 +437,7 @@ def _dependencies_html(out_dir: str) -> str:
         ("packages_unpinned", "could not pin")))
     rows = ""
     for a in (dep.get("advisories") or [])[:80]:
-        fixed = _e(a.get("fixed_version")) or f'<span class="cls">{_e(a.get("fix_note")) or "none published"}</span>'
+        fixed = _e(a["fixed_version"]) if a.get("fixed_version") else f'<span class="cls">{_e(a.get("fix_note")) if a.get("fix_note") else "none published"}</span>'
         rows += (f'<tr><td><span class="pill sev-{_e(a.get("severity"))}">{_e(a.get("severity"))}</span></td>'
                  f'<td class="file">{_e(a.get("package"))}</td><td>{_e(a.get("installed"))}</td>'
                  f'<td class="file">{_e(a.get("advisory_id"))}</td><td>{fixed}</td>'
@@ -443,6 +469,101 @@ def _dependencies_html(out_dir: str) -> str:
             f'<div class="chips">{chips}</div>{extra}'
             '<table><tr><th>sev</th><th>package</th><th>installed</th><th>advisory</th>'
             f'<th>fixed in</th><th>disposition</th><th>why</th></tr>{rows}</table>')
+
+
+def _declarative_waf_html(out_dir: str, *, target: str, title: str, box: str,
+                          form_label: str, verify_on: str, staging_note: str) -> str:
+    """The bring-your-own declarative-WAF surface for ONE enforcement point (BIG-IP Advanced WAF or
+    F5 WAF for NGINX). For each band-aid this run generated, whether the operator's own box gets a
+    real form or an honest decline — computed from the SAME emitter the console's apply panel drives,
+    over the run's recorded `policies.json` + `probes.json`. The three forms are identical across
+    targets, so this one code path renders both; only `target` and the display strings differ. A
+    decline here is real, never fabricated: the probe is present, so `emit` gives the exact per-finding
+    answer, and controls with no form (rate-limit / bot / malicious-user) or the declined `waf` carry
+    their reason."""
+    out = Path(out_dir)
+    policies = _load(out, "policies.json", [])
+    if not policies:
+        return ""
+    probes = {p.get("finding_id"): p for p in _load(out, "probes.json", []) if isinstance(p, dict)}
+    from .emitters import emit as _emit, EmitError, AWAF_FORMS
+
+    ok_rows = ""
+    no_form: dict[str, dict] = {}    # control has no declarative-WAF object at all (structural)
+    no_data: dict[str, dict] = {}    # a form exists, but this finding lacks the data to emit it
+    for entry in policies:
+        if not isinstance(entry, dict):
+            continue
+        fid, control, name = (entry.get("finding_id", ""), entry.get("control", ""),
+                              entry.get("policy_name", ""))
+        sp = out / "policies" / f"{control}.{name}.json"
+        try:
+            spec = json.loads(sp.read_text()) if sp.exists() else None
+        except (json.JSONDecodeError, OSError):
+            spec = None
+        try:
+            r = _emit(target=target, control=control, policy_name=name,
+                      probe=probes.get(fid), spec=spec)
+        except EmitError:
+            continue
+        if r.supported:
+            # a supported-form finding may still carry a caveat (e.g. a nested JSON parameter whose
+            # ASM name is undocumented) — surfaced, not hidden behind the green "form emitted".
+            caveat = f' <span class="badge">verify on {verify_on}</span>' if r.reason else ""
+            ok_rows += (f'<tr><td>{_e(fid)}</td><td>{_e(control)}</td>'
+                        f'<td>{_e(AWAF_FORMS.get(control, ""))}</td><td class="file">{_e(name)}</td>'
+                        f'<td><span class="st-remediated">form emitted</span>{caveat}</td></tr>')
+        else:
+            # Split the two honest ways a band-aid does not reach the box: a control with a form that
+            # just lacked the recorded data for THIS finding (a data gap, not a form gap) vs a control
+            # with no form at all. Collapsing them would let "this finding is missing a probe" read as
+            # "the box can't do this class", which is a different, wrong claim.
+            bucket = no_data if control in AWAF_FORMS else no_form
+            bucket.setdefault(control, {"reason": r.reason, "ids": []})["ids"].append(fid)
+
+    if not ok_rows and not no_form and not no_data:
+        return ""
+    parts = [f'<h2>{title} <span class="cls">bring-your-own — the same finding, emitted for a '
+             f'{box} you already run</span></h2>']
+    if ok_rows:
+        parts.append(f'<table><tr><th>finding</th><th>control</th><th>{form_label} form</th>'
+                     f'<th>policy</th><th>on {box}</th></tr>{ok_rows}</table>')
+
+    def _decl(group, heading):
+        if not group:
+            return ""
+        items = "".join(
+            f'<li><span class="mono">{_e(c)}</span> — {_e(group[c]["reason"])} '
+            f'<span class="cls">({", ".join(_e(i) for i in group[c]["ids"])})</span></li>'
+            for c in sorted(group))
+        return (f'<p class="sub" style="margin-top:8px"><strong>{heading}</strong></p>'
+                f'<ul class="sub" style="margin:4px 0 0;padding-left:18px">{items}</ul>')
+
+    parts.append(_decl(no_form, f"No {form_label} form on {box} — considered and declined, "
+                                f"not skipped (these controls have no {form_label} object; XC-only)"))
+    parts.append(_decl(no_data, f"An {form_label} form exists, but this finding lacked the recorded "
+                                 "data to emit it"))
+    # Name the full shipped-form set regardless of what this run exercised. Sourced from the emitter
+    # registry — one place names the forms, for both targets.
+    forms = ", ".join(f"{_e(c)} ({_e(f)})" for c, f in AWAF_FORMS.items())
+    parts.append(f'<p class="cls" style="margin-top:8px">Shipped {form_label} forms: '
+                 f'{forms}, all live-proven. <span class="mono">waf</span> (attack signatures) is '
+                 f'declined — {staging_note}. rate-limit / '
+                 f'malicious-user / bot-defense have no {form_label} object and remain XC-only.</p>')
+    return "".join(parts)
+
+
+def _bigip_html(out_dir: str) -> str:
+    return _declarative_waf_html(out_dir, target="bigip-awaf", title="BIG-IP Advanced WAF",
+                                 box="BIG-IP", form_label="Advanced-WAF", verify_on="appliance",
+                                 staging_note="ASM keeps freshly-imported signatures in staging")
+
+
+def _nginx_html(out_dir: str) -> str:
+    return _declarative_waf_html(out_dir, target="nginx-app-protect",
+                                 title="F5 WAF for NGINX (App Protect)", box="NGINX",
+                                 form_label="App Protect", verify_on="the box",
+                                 staging_note="NAP keeps freshly-imported signatures in staging")
 
 
 def build_report(out_dir: str = "out") -> str:
@@ -552,8 +673,8 @@ def build_report(out_dir: str = "out") -> str:
     return f"""<!doctype html><html lang="en"><head><meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>virtual-patch-copilot · report</title><style>{_CSS}</style></head><body>
-<header><h1>virtual-patch<span class="dot">·</span>copilot <span style="font-weight:400">— scan report</span></h1>
-<div class="sub">{target} · generated {_e(ts)}</div></header>
+<header>{_MARK}<div class="htext"><h1>virtual-patch<span class="dot">·</span>copilot <span style="font-weight:400">— scan report</span></h1>
+<div class="sub">{target} · generated {_e(ts)}</div></div></header>
 <main>
 {_hero_html(im)}
 <h2>Run summary</h2><div class="chips">{chips}</div>
@@ -563,6 +684,8 @@ def build_report(out_dir: str = "out") -> str:
 {_dependencies_html(out_dir)}
 <h2>Findings &amp; band-aid coverage</h2>{cards or '<p class="cls">No findings.</p>'}
 <h2>Generated XC band-aid policies</h2>{pol_html or '<p class="cls">None.</p>'}
+{_bigip_html(out_dir)}
+{_nginx_html(out_dir)}
 {impact_html}
 {led_html}
 </main>

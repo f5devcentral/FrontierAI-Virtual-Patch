@@ -453,8 +453,11 @@ the latest run.
 vpcopilot console         # http://127.0.0.1:8787
 ```
 A six-step stepper that follows the lifecycle, plus a **⚙ Setup** page. A persistent hero band
-(exploitable vulns → mitigated live in seconds, vs. change-control days) sits above every step, the
-header carries a live model switcher, and each step is deep-linkable (`#mitigate`, `#retire`, …).
+(exploitable vulns → mitigated live in seconds, vs. change-control days) sits above every step, and
+each step is deep-linkable (`#mitigate`, `#retire`, …). Secondary inputs, tuning knobs, and
+integration panels sit behind *Advanced* disclosures to keep the everyday path clean; a ⑦ Benchmark
+step and a live header model switcher appear only in **advanced mode** (set `VPCOPILOT_ADVANCED`, or
+keep more than one `config/agents*.yaml`).
 
 | Step | What |
 |---|---|
@@ -464,7 +467,7 @@ header carries a live model switcher, and each step is deep-linkable (`#mitigate
 | **④ Mitigate** | apply each band-aid (or **Mitigate ALL**, one at a time, continuing past failures) and watch `before → after` stream, with a *self-healed in N attempts* badge |
 | **⑤ Cure** | open the code-fix PR per finding, or all of them |
 | **⑥ Retire** | the four-state ledger track, plus the **Audit trail** table and **Export evidence bundle (.zip)** / **All runs** |
-| **⑦ Benchmark** | build a model-tagged report from this run, then compare models side by side per target app |
+| **⑦ Benchmark** *(advanced mode)* | build a model-tagged report from this run, then compare models side by side per target app |
 | **⚙ Setup** | credentials (writes `.env`), XC status, the per-agent model wiring, and the report buttons |
 
 ## 7b. The BIG-IP lab (L2)
@@ -750,7 +753,7 @@ from your XC namespace (with their domains), scan targets from sibling directori
 **XC security dashboard ↗** link points at:
 ```sh
 VPCOPILOT_DEFAULT_LB=vampi-lab
-VPCOPILOT_DEFAULT_URL=https://vampi.banknimbus.com
+VPCOPILOT_DEFAULT_URL=https://vampi.example.com
 VPCOPILOT_DEFAULT_REPO=owner/repo        # a repo you can push code-fix PRs to
 VPCOPILOT_DEFAULT_BASE=main
 VPCOPILOT_DEFAULT_PREFIX=                 # usually empty
@@ -784,6 +787,6 @@ vpcopilot apply --from-scan out/policies/service_policy.deny-negative-pay-amount
 vpcopilot pr    --repo <owner>/nimbus-demo --base vuln-lab --path-prefix app/src/app/api --finding neg-pay-001 --dry-run
 vpcopilot ledger
 ```
-Apply/validate default to the **isolated test LB `vpcopilot-lab`** (`https://lab.banknimbus.com`),
+Apply/validate default to the **isolated test LB `vpcopilot-lab`** (`https://lab.example.com`),
 so agent-run demos never touch the live `nimbus-www` security-demo path. Drop `--dry-run` to go
 live on the test LB. `nimbus-www` is protected — mutating it requires `--allow-protected-lb`.

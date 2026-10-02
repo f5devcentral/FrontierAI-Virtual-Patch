@@ -4,6 +4,8 @@
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 ![Python](https://img.shields.io/badge/python-3.10%E2%80%933.12-blue.svg)
 
+[![Find the vulnerability, mitigate it live on the F5 proxy you already run, ship the code fix, retire the band-aid](docs/images/flow-hero.svg)](docs/images/flow-pipeline.svg)
+
 An agent pipeline that **finds application vulnerabilities, mitigates each live with the right
 F5 Distributed Cloud (XC) control, and drafts the real code fix** — so the exposure window
 between "AI found a vuln" and "the code fix ships" collapses from weeks to minutes, with a human
@@ -21,6 +23,16 @@ Three properties make it something you could actually point at production:
   vulnerability justified it*, whether it's still live, and who ran it — exportable as a
   SHA-256-manifested evidence bundle for a change board. See **[docs/AUDIT.md](docs/AUDIT.md)**.
 
+**One finding, every enforcement point.** The band-aid is a *declarative* policy, so the same finding
+is mitigated on whichever F5 WAF you already run — **F5 Distributed Cloud**, **BIG-IP Advanced WAF**,
+or **F5 WAF for NGINX (App Protect)**. The copilot emits it for each, applies it on your own box
+behind the same human gate, and proves it against the finding's real exploit (all three forms —
+value-constraint, response-masking, and API-contract — are proven on live BIG-IP and NGINX+App-Protect
+appliances). Written for the admins who run those boxes: **[docs/BIGIP.md](docs/BIGIP.md)** ·
+**[docs/NGINX.md](docs/NGINX.md)**.
+
+![Apply on your own BIG-IP or NGINX — the same finding, the appliance you already run](docs/images/apply-your-own-waf.png)
+
 It is **model-independent**: every agent's model is chosen in `config/agents.yaml`, so you run it
 on Claude, OpenAI, Gemini, or local Ollama — per agent or globally — with no code change.
 
@@ -28,17 +40,14 @@ on Claude, OpenAI, Gemini, or local Ollama — per agent or globally — with no
 
 ## How it works
 
-```
-repo ─▶ discover ─▶ verify ─▶ triage ─▶ generate ─┬▶ apply  (XC band-aid: snapshot → self-test →
-        (find)    (refute)  (route)   (XC config) │         attach → validate → refine → keep/rollback)
-                                       remediate  └▶ open PR (the real code fix — the cure)
-                                                        │
-                          ledger: found → mitigated → remediated → retire (detach the band-aid)
-                          audit:  every mutating step, appended and exportable as evidence
-```
+[![Scan input feeds eight agents, which find and verify a vulnerability, pick the control, write the band-aid and prove it blocks — then apply it to F5 Distributed Cloud, F5 WAF for NGINX or BIG-IP Advanced WAF and retire it once the code fix lands](docs/images/flow-pipeline.svg)](docs/images/flow-pipeline.svg)
+
+<sub>Click through for the full-size diagram. It is generated — see [`docs/images/src/`](docs/images/src/).</sub>
 
 - **discover → verify** find candidates and adversarially refute the weak ones (calibrated,
   severity-weighted confidence gate; each distinct vuln reported once, with its effective endpoint).
+  The input can be a repo, a **CVE / advisory id** (resolved via OSV.dev), **dependency manifests**,
+  or an **OpenAPI spec** — alone or combined (a spec against a repo also reports spec-vs-code drift).
 - **triage** routes each finding to the strongest control: `service_policy` · `waf` ·
   `waf_data_guard` · `api_schema` · `malicious_user` · `bot_defense` · `rate_limit` — or
   code-only when no band-aid fits.
@@ -95,21 +104,28 @@ reference: **[docs/USAGE.md](docs/USAGE.md)**.
 
 ## The console
 
-A guided flow that follows the lifecycle — a persistent hero band (N exploitable → mitigated live
-in seconds vs. change-control days) sits on top of seven steps:
+A guided flow that follows the lifecycle — a persistent hero band (N exploitable →
+mitigated live in seconds vs. change-control days) sits on top of six steps:
 
-1. **Scan** — point at a repo; read-only, safe. The log holds the whole transcript in a scrollable
-   box, so a long run can be read end-to-end while it's still going.
-2. **Review** — findings + the recommended XC control; click a row to inspect exploit / code / policy.
+1. **Scan** — point at a repo (a CVE, dependency manifests, or an OpenAPI spec live under *Other
+   inputs*); read-only, safe. The log holds the whole transcript in a scrollable box, so a long run
+   can be read end-to-end while it's still going.
+2. **Review** — findings + the recommended XC control (with the CWE / OWASP-API mapping); click a row
+   to inspect exploit / code / policy.
 3. **Simulate** — replay a recorded traffic sample against each candidate through a spare LB and see
    what it *would* block before anything touches production. A policy over the false-positive
    threshold warns at the gate and needs an explicit, audited override.
-4. **Mitigate** — apply each band-aid live; the refiner streams `before 200 → after 403 BLOCKED`
-   with a *self-healed in N attempts* / *unfixable → ship the code fix* badge.
+4. **Mitigate** — one click per finding (or *Mitigate ALL*) applies each band-aid live: attach →
+   validate against the finding's real exploit → self-heal or ship the code fix. Dry-run rehearses
+   first.
 5. **Cure** — open the code-fix PR for each finding.
-6. **Retire** — the four-state ledger track, and the **audit trail** of every change made to a load
-   balancer — exportable as an evidence bundle.
-7. **Benchmark** — build a model-tagged report from this run, then compare models side by side.
+6. **Retire** — patch-expiry (each band-aid carries a TTL) and a **reconcile** loop that re-fires the
+   exploit at the origin once the cure PR lands, the four-state ledger, and the **audit trail** of
+   every change made to a load balancer — exportable as an evidence bundle.
+
+The everyday path stays uncluttered: secondary inputs, tuning knobs, and integration panels sit
+behind *Advanced* disclosures. A model-comparison **Benchmark** step and a live model switcher appear
+in **advanced mode** — set `VPCOPILOT_ADVANCED`, or keep more than one `config/agents*.yaml`.
 
 The shareable HTML report opens (or downloads) from **Review** and from **Setup** — it is rebuilt
 from the current run dir on every open, so it's always the latest run. Credentials, XC status, and
@@ -121,20 +137,25 @@ requests, all of them attacks on the login endpoint:
 
 ![Simulate step — blast radius](docs/images/3-simulate.png)
 
-**④ Mitigate** — apply each band-aid and watch it validate:
+**④ Mitigate** — one click per finding (or *Mitigate ALL*) applies and validates each band-aid live
+on XC. The same step also carries **Apply on your own BIG-IP** and **Apply on your own NGINX** panels
+(driven by the emitter, so every form is selectable and every decline says why) — the identical
+band-aid, on the appliance you already run:
 
 ![Mitigate step](docs/images/4-mitigate.png)
 
-**⑥ Retire** — the four-state ledger (here `crapi-sqli-001` walked all the way to *retired*), and
-under it the audit trail: each change tied to the vulnerability that justified it, the LB and XC
-namespace it touched, whether it's still live, and who ran it. Dry runs are absent by design —
-nothing changed, so there is nothing to answer for.
+**⑥ Retire** — patch-expiry (band-aids past their TTL, flagged for reconcile), the four-state ledger
+(here `crapi-sqli-001` walked all the way to *retired*), and under it the audit trail: each change
+tied to the vulnerability that justified it, the LB and XC namespace it touched, whether it's still
+live, and who ran it. Dry runs are absent by design — nothing changed, so there is nothing to answer
+for.
 
 ![Retire step — ledger and audit trail](docs/images/6-retire.png)
 
-Every scan also drops a standalone, shareable **`report.html`** — the same hero plus at-a-glance
-bars, the self-heal (`200 → 403`, *self-healed ×2*), the rate-limit behavioral proof, and the
-ledger:
+Every scan also drops a standalone, shareable **`report.html`** — the same look, the same hero,
+the at-a-glance bars (severity, XC control, and the OWASP-API grouping), pipeline metrics, and —
+further down — per-finding band-aid coverage with the self-heal (`200 → 403`, *self-healed ×2*) and
+the ledger:
 
 ![HTML report](docs/images/report.png)
 
@@ -145,6 +166,8 @@ ledger:
 | [docs/TRY_IT.md](docs/TRY_IT.md) | try it on safe repos (VAmPI / crAPI) before your own |
 | [docs/DEMO.md](docs/DEMO.md) | 5-minute runbook (offline + live) |
 | [docs/USAGE.md](docs/USAGE.md) | full CLI + console reference |
+| [docs/BIGIP.md](docs/BIGIP.md) | using it with your own BIG-IP (Advanced WAF) — written for BIG-IP admins |
+| [docs/NGINX.md](docs/NGINX.md) | using it with your own NGINX + App Protect — written for NGINX admins |
 | [docs/AUDIT.md](docs/AUDIT.md) | the audit trail and the evidence export — what is recorded, and how to verify a bundle |
 | [DESIGN.md](DESIGN.md) | architecture |
 | [MODELS.md](MODELS.md) | cross-provider model notes |

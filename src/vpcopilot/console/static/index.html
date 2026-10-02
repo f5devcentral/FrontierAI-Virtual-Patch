@@ -5,12 +5,16 @@
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>virtual-patch-copilot · console</title>
 <style>
-  :root { --ink:#121624; --navy:#1b2a4a; --f5:#e4002b; --grey:#6a7282; --line:#dfe4ee;
-          --ok:#167c3a; --amber:#b45a00; --bg:#f6f8fc; --slate:#5b7089; --indigo:#4b57b8; --plum:#7b5aa6; }
+  /* Palette: black + white + a red accent, with blue/purple/magenta/orange/green for categorical fills. */
+  :root { --ink:#17181c; --navy:#111317; --f5:#e4002b; --grey:#6a7282; --line:#e4e2e6;
+          --ok:#009639; --amber:#b45a00; --bg:#f5f5f7; --slate:#5b7089; --indigo:#0e41aa; --plum:#61228b;
+          --f5-blue:#0e41aa; --f5-purple:#61228b; --f5-magenta:#ab2782; --f5-orange:#f29a36; --f5-green:#009639; }
   * { box-sizing:border-box; }
-  body { margin:0; font:14px/1.45 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif; color:var(--ink); background:var(--bg); }
-  header { background:var(--navy); color:#fff; padding:14px 20px; display:flex; align-items:center; gap:12px; }
-  header h1 { font-size:16px; margin:0; font-weight:700; } header .dot { color:var(--f5); }
+  body { margin:0; font:14px/1.45 "Aptos","Aptos Display",-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif; color:var(--ink); background:var(--bg); }
+  header { background:var(--navy); color:#fff; padding:12px 20px; display:flex; align-items:center; gap:12px; border-bottom:3px solid var(--f5); }
+  header .logo { width:30px; height:30px; display:flex; flex:0 0 auto; }
+  header .logo svg { width:100%; height:100%; display:block; }
+  header h1 { font-size:16px; margin:0; font-weight:800; letter-spacing:-.01em; } header .dot { color:var(--f5); }
   main { padding:20px; max-width:1180px; margin:0 auto; }
   section { display:none; } section.active { display:block; }
   h2 { font-size:15px; margin:0 0 4px; } .sub { color:var(--grey); font-size:12.5px; margin:0 0 14px; }
@@ -40,7 +44,7 @@
   button.mini.primary { background:var(--f5); color:#fff; border-color:var(--f5); }
   button.mini.retire { border-color:#1b4fa1; color:#1b4fa1; }
   button.mini:disabled { opacity:.4; cursor:not-allowed; }
-  pre { background:#0f1422; color:#d7e0f2; padding:12px; border-radius:8px; overflow:auto; font-size:12px; white-space:pre-wrap; }
+  pre { background:#16171b; color:#e2e0e3; padding:12px; border-radius:8px; overflow:auto; font-size:12px; white-space:pre-wrap; }
   .muted { color:var(--grey); } .mono { font-family:ui-monospace,Menlo,monospace; } a { color:#1b4fa1; }
   .act { font-size:12px; display:block; margin-top:3px; } .act.ok{color:var(--ok)} .act.err{color:#a1001b}
   /* stepper nav */
@@ -53,11 +57,11 @@
   .conn { color:var(--line); font-weight:700; padding:0 2px; }
   .setup-btn { margin-left:auto; }
   /* hero */
-  .hero { background:linear-gradient(120deg,#1b2a4a,#25406e); color:#fff; border-radius:12px; padding:18px 22px;
-          display:flex; gap:14px; align-items:center; flex-wrap:wrap; margin-bottom:16px; }
+  .hero { background:linear-gradient(120deg,#111317,#2a2c31); color:#fff; border-radius:12px; padding:18px 22px;
+          display:flex; gap:14px; align-items:center; flex-wrap:wrap; margin-bottom:16px; border-left:4px solid var(--f5); }
   .hstat { text-align:center; min-width:92px; } .hstat.dim { opacity:.72; }
-  .hstat .big { font-size:28px; font-weight:800; line-height:1.05; } .hstat .lbl { font-size:11px; color:#c7d2e8; margin-top:2px; }
-  .hsep { font-size:19px; font-weight:800; color:#7f93bd; } .hero .redline { color:#ff98a8; }
+  .hstat .big { font-size:28px; font-weight:800; line-height:1.05; } .hstat .lbl { font-size:11px; color:#cfccce; margin-top:2px; }
+  .hsep { font-size:19px; font-weight:800; color:#5a5c61; } .hero .redline { color:#ff8a99; }
   /* settings bar */
   #settings { display:none; }
   .setbar { background:#fff; border:1px solid var(--line); border-radius:10px; padding:8px 14px; margin-bottom:14px; }
@@ -91,7 +95,7 @@
   /* ⑦ benchmark dashboard */
   .bcards { display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); gap:12px; margin-bottom:16px; }
   .bcard { background:#fff; border:1px solid var(--line); border-radius:12px; padding:14px 15px; }
-  .bcard.win { border-color:#bcd8ec; background:#eef5fb; }
+  .bcard.win { border-color:#f2c9d1; background:#fdeff2; }
   .bwho { display:flex; align-items:center; gap:8px; font-weight:700; font-size:15px; }
   .bwin { font-size:10px; letter-spacing:.08em; text-transform:uppercase; color:#fff; background:var(--navy); border-radius:20px; padding:2px 7px; }
   .bmodel { font-size:11px; margin-top:1px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
@@ -111,13 +115,23 @@
   .bchip.g{color:var(--ok);background:#e5f3ea} .bchip.a{color:var(--amber);background:#f6efdb}
   .bchip.s{color:var(--slate);background:#e7ecf2} .bchip.i{color:var(--indigo);background:#e7e9f7}
   .bchip.b{color:var(--f5);background:#f7e3e6} .bchip.f{color:var(--plum);background:#efe7f5} .bchip.z{color:var(--grey);background:transparent}
+  /* progressive-disclosure "Advanced" sections — keep the everyday path uncluttered */
+  details.adv { margin:10px 0 2px; }
+  details.adv > summary { cursor:pointer; color:var(--slate); font-size:13px; font-weight:600; padding:6px 0; list-style:none; }
+  details.adv > summary::-webkit-details-marker { display:none; }
+  details.adv[open] > summary { color:var(--ink); }
+  details.adv > .card { margin-top:10px; }
 </style>
 </head>
 <body>
-<header><h1>virtual-patch<span class="dot">·</span>copilot</h1>
-  <span class="muted" style="color:#c7d2e8">find → mitigate → cure → retire</span>
-  <span style="margin-left:auto;display:flex;align-items:center;gap:8px;color:#c7d2e8;font-size:12px">model
-    <select id="modelSel" onchange="setModel(this.value)" style="width:auto;padding:4px 8px;border-radius:8px;border:1px solid #3a4d74;background:#25406e;color:#fff"></select>
+<header><span class="logo" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none"><path d="M12 1.9 4 4.9v6.3c0 5.1 3.3 9 8 10.5 4.7-1.5 8-5.4 8-10.5V4.9L12 1.9Z" stroke="#fff" stroke-width="1.6" stroke-linejoin="round"/><rect x="6.2" y="10.1" width="11.6" height="4.4" rx="2.2" transform="rotate(-38 12 12.3)" fill="#e4002b"/><circle cx="12" cy="12.3" r="1.05" fill="#fff"/></svg></span><h1>virtual-patch<span class="dot">·</span>copilot</h1>
+  <span class="muted" style="color:#cfccce">find → mitigate → cure → retire</span>
+  <span id="sessionBar" style="margin-left:auto;display:flex;align-items:center;gap:6px;color:#cfccce;font-size:12px">session
+    <select id="sessionSel" onchange="openSession(this.value)" title="switch the active scan session" style="width:auto;max-width:210px;padding:4px 8px;border-radius:8px;border:1px solid #3a3c42;background:#2a2c31;color:#fff"></select>
+    <button class="mini" style="background:#2a2c31;border-color:#3a3c42;color:#fff" onclick="newSession()" title="start a fresh named session">＋ New</button>
+  </span>
+  <span id="modelSwitch" style="margin-left:12px;display:none;align-items:center;gap:8px;color:#cfccce;font-size:12px">model
+    <select id="modelSel" onchange="setModel(this.value)" style="width:auto;padding:4px 8px;border-radius:8px;border:1px solid #3a3c42;background:#2a2c31;color:#fff"></select>
   </span>
 </header>
 <nav id="steps" class="steps"></nav>
@@ -127,7 +141,7 @@
   <datalist id="scanRepoList"></datalist>
   <datalist id="scanOutList"></datalist>
   <datalist id="prRepoList"></datalist>
-  <div id="hero" class="hero"><span class="muted" style="color:#c7d2e8">No run yet — start at ① Scan.</span></div>
+  <div id="hero" class="hero"><span class="muted" style="color:#cfccce">No run yet — start at ① Scan.</span></div>
 
   <details id="settings" class="setbar">
     <summary>▸ Run settings <span id="modeLine" class="mode"></span></summary>
@@ -136,15 +150,19 @@
       <div><label>Validate URL</label><input type="text" id="setUrl" list="urlList" value="" placeholder="pick an LB above — URL auto-fills" /></div>
       <div><label>PR repo</label><input type="text" id="setRepo" list="prRepoList" value="" placeholder="owner/repo (a repo you can push to)" /></div>
       <div><label>PR base</label><input type="text" id="setBase" value="" placeholder="main" /></div>
-      <div><label>Path prefix</label><input type="text" id="setPrefix" value="" placeholder="(usually empty)" /></div>
     </div>
     <div class="cbs">
       <label><input type="checkbox" id="setDry" checked onchange="updateMode()" /> dry-run (no live changes)</label>
       <label><input type="checkbox" id="setRefine" checked onchange="updateMode()" /> refine</label>
-      <label>attempts <input type="number" id="setRefineAttempts" value="3" min="1" max="10" style="width:56px" onchange="updateMode()" /></label>
       <label><input type="checkbox" id="setKeep" onchange="updateMode()" /> keep live</label>
-      <label><input type="checkbox" id="setAllow" onchange="updateMode()" /> allow protected LB</label>
     </div>
+    <details class="adv"><summary>▸ Advanced</summary>
+      <div class="rowf" style="margin-top:10px">
+        <div><label>Path prefix</label><input type="text" id="setPrefix" value="" placeholder="(usually empty)" /></div>
+        <div><label>refine attempts</label><input type="number" id="setRefineAttempts" value="3" min="1" max="10" onchange="updateMode()" /></div>
+      </div>
+      <div class="cbs"><label><input type="checkbox" id="setAllow" onchange="updateMode()" /> allow protected LB</label></div>
+    </details>
   </details>
 
   <!-- ① SCAN -->
@@ -152,27 +170,31 @@
     <div class="card"><h2>① Scan a repository</h2>
       <p class="sub">Read-only and safe — no XC or GitHub writes happen here. Point it at a vulnerable app (try crapi/VAmPI first — see docs/TRY_IT.md).</p>
       <label>Target repo / directory</label><input type="text" id="scanRepo" list="scanRepoList" placeholder="pick a sibling app repo, or type a path" />
-      <label>…or a security advisory <span class="muted">(H1 — scan a CVE instead of a repo)</span></label>
-      <input type="text" id="scanCve" placeholder="CVE-2024-23334 · GHSA-… · PYSEC-… — resolved from OSV.dev, no credentials needed" />
-      <label>…or an OpenAPI spec <span class="muted">(H3 — find the flaws in the contract; add it to a repo scan to also report spec/code drift)</span></label>
-      <input type="text" id="scanSpec" placeholder="path to openapi.yaml or swagger.json" />
-      <label>…or dependency manifests <span class="muted">(H2 — resolve every pinned package against OSV; comma-separated, alone or alongside a repo)</span></label>
-      <input type="text" id="scanManifest" placeholder="requirements.txt, package-lock.json, pom.xml — no credentials needed" />
-      <div class="rowf">
-        <div><label>Min severity <span class="muted">(manifest)</span></label>
-          <select id="scanMinSeverity"><option>critical</option><option selected>high</option><option>medium</option><option>low</option></select></div>
-        <div><label>Max advisories <span class="muted">(0 = no cap)</span></label><input type="number" id="scanMaxAdvisories" value="25" min="0" /></div>
-        <div><label>&nbsp;</label><button class="mini" onclick="surveyDeps()">Preview (no model calls)</button></div>
-        <div><label>&nbsp;</label><label class="muted"><input type="checkbox" id="scanIncludeDev" /> include dev/test deps</label></div>
-      </div>
-      <div id="depsPreview" style="display:none"></div>
       <div class="rowf">
         <div><label>Output dir</label><input type="text" id="scanOut" list="scanOutList" value="" placeholder="e.g. out-dgx-vampi (or pick a run dir)" /></div>
-        <div><label>Min confidence</label><input type="number" id="scanMinConf" value="0.5" step="0.05" min="0" max="1" /></div>
-        <div><label>Max files</label><input type="number" id="scanMaxFiles" value="200" min="1" /></div>
-        <div><label>Max bytes/file</label><input type="number" id="scanMaxBytes" value="60000" min="1000" step="1000" /></div>
       </div>
       <div class="cbs"><label><input type="checkbox" id="scanRemediate" checked /> draft code fixes (PRs) <span class="muted">— off = band-aids only, saves ~half the tokens</span></label></div>
+      <details class="adv"><summary>▸ Other inputs &amp; tuning <span class="muted">— scan a CVE / OpenAPI spec / dependency manifests instead of (or with) a repo, plus limits</span></summary>
+        <label>A security advisory <span class="muted">(H1 — scan a CVE instead of a repo)</span></label>
+        <input type="text" id="scanCve" placeholder="CVE-2024-23334 · GHSA-… · PYSEC-… — resolved from OSV.dev, no credentials needed" />
+        <label>An OpenAPI spec <span class="muted">(H3 — find the flaws in the contract; add it to a repo scan to also report spec/code drift)</span></label>
+        <input type="text" id="scanSpec" placeholder="path to openapi.yaml or swagger.json" />
+        <label>Dependency manifests <span class="muted">(H2 — resolve every pinned package against OSV; comma-separated, alone or alongside a repo)</span></label>
+        <input type="text" id="scanManifest" placeholder="requirements.txt, package-lock.json, pom.xml — no credentials needed" />
+        <div class="rowf">
+          <div><label>Min severity <span class="muted">(manifest)</span></label>
+            <select id="scanMinSeverity"><option>critical</option><option selected>high</option><option>medium</option><option>low</option></select></div>
+          <div><label>Max advisories <span class="muted">(0 = no cap)</span></label><input type="number" id="scanMaxAdvisories" value="25" min="0" /></div>
+          <div><label>&nbsp;</label><button class="mini" onclick="surveyDeps()">Preview (no model calls)</button></div>
+          <div><label>&nbsp;</label><label class="muted"><input type="checkbox" id="scanIncludeDev" /> include dev/test deps</label></div>
+        </div>
+        <div id="depsPreview" style="display:none"></div>
+        <div class="rowf">
+          <div><label>Min confidence</label><input type="number" id="scanMinConf" value="0.5" step="0.05" min="0" max="1" /></div>
+          <div><label>Max files</label><input type="number" id="scanMaxFiles" value="200" min="1" /></div>
+          <div><label>Max bytes/file</label><input type="number" id="scanMaxBytes" value="60000" min="1000" step="1000" /></div>
+        </div>
+      </details>
       <button class="go" onclick="runScan()">Run scan</button>
       <div id="scanState" class="muted" style="margin-top:10px"></div>
       <div id="scanLogWrap" style="display:none"><pre id="scanLog" class="logbox"></pre>
@@ -193,18 +215,23 @@
       <div id="reviewBox">Loading…</div>
       <div id="correlations" class="muted" style="margin-top:10px"></div>
     </div>
-    <div class="card"><h2>One finding, every enforcement point <span class="muted">— emit the same band-aid for the WAF you already own (L1)</span></h2>
-      <div class="rowa">
-        <label style="margin:0 8px 0 0">Target</label>
-        <select id="emitTarget" style="width:auto;min-width:230px"></select>
-        <button class="go" style="margin-top:0" onclick="runEmit()">Emit</button>
+    <details class="adv"><summary>Emit for another WAF <span class="muted">— BIG-IP Advanced WAF / NGINX App Protect (L1)</span></summary>
+      <div class="card"><h2>One finding, every enforcement point <span class="muted">— emit the same band-aid for the WAF you already own (L1)</span></h2>
+        <div class="rowa">
+          <label style="margin:0 8px 0 0">Target</label>
+          <select id="emitTarget" style="width:auto;min-width:230px"></select>
+          <button class="go" style="margin-top:0" onclick="runEmit()">Emit</button>
+        </div>
+        <p class="sub" style="margin-top:8px">Emits each band-aid for the chosen enforcement point and lists <b>every</b> finding —
+          the ones a form exists for and the ones it declines, with the reason, because "we didn't emit this" and "there's nothing to emit" are different answers.
+          BIG-IP Advanced WAF ships three forms: a <b>declarative WAF policy</b> (<span class="mono">service_policy</span>, a value constraint BIG-IP and F5 WAF for NGINX both consume — they differ only in <span class="mono">template.name</span>),
+          <span class="mono">waf_data_guard</span> (response masking) and <span class="mono">api_schema</span> (API contract).
+          <span class="mono">waf</span> (attack signatures) is declined — ASM keeps freshly-imported signatures in staging (log-only), proven on a live box — and rate-limit / bot / malicious-user have no Advanced-WAF object at all.
+          Constraints are derived <b>by code</b> from the recorded exploit and legit requests, not by a model.
+          Read-only: this produces a document and touches no tenant or appliance.</p>
+        <div id="emitBox"></div>
       </div>
-      <p class="sub" style="margin-top:8px">A <b>declarative WAF policy</b>, which BIG-IP Advanced WAF and
-        F5 WAF for NGINX (App Protect) both consume — the two differ only in <span class="mono">template.name</span>.
-        The constraint is derived <b>by code</b> from the recorded exploit and legit requests, not by a model.
-        Read-only: this produces a document and touches no tenant or appliance.</p>
-      <div id="emitBox"></div>
-    </div>
+    </details>
   </section>
 
   <!-- ③ SIMULATE -->
@@ -233,6 +260,40 @@
       <p class="sub">Apply each recommended band-aid to the load balancer and validate it against the finding's real exploit — attach → validate → refine → keep or roll back. Turn off dry-run in Run settings to make it live. <b>“✓ covered by …”</b> means a sibling finding's band-aid already protects this one (same file + control). Only per-request controls (service_policy, api_schema) block a single fired exploit; rate-limit / bot / malicious-user / data-guard are behavioral and validate at config level.</p>
       <div id="driftBox"></div>
       <div id="mitigateBox">Loading…</div>
+      <details class="adv" id="bigipApply"><summary>Apply on your own BIG-IP (Advanced WAF)</summary>
+        <div id="baStatus" class="muted" style="margin:8px 0">…</div>
+        <div class="rowf">
+          <div><label>Finding</label><select id="baFinding"></select></div>
+          <div><label>Tenant</label><input type="text" id="baTenant" value="vpcopilot_lab" /></div>
+          <div><label>App</label><input type="text" id="baApp" value="lab" /></div>
+          <div><label>App URL</label><input type="text" id="baUrl" list="urlList" placeholder="https://your-app" /></div>
+        </div>
+        <div class="cbs">
+          <label><input type="checkbox" id="baDry" checked /> dry-run (preview only)</label>
+          <label><input type="checkbox" id="baKeep" /> keep enforcing (else roll back after a passing smoke)</label>
+        </div>
+        <button class="go" onclick="runBigipApply()">Apply on BIG-IP ▶</button>
+        <div id="baJob" class="jobbox" style="display:none;margin-top:10px"></div>
+        <div id="baDeclined" class="sub" style="margin-top:8px"></div>
+        <p class="sub" style="margin-top:8px">Requires <span class="mono">vpcopilot bigip-lab create</span> to have stood the tenant up + BIG-IP creds in ⚙ Setup. Three Advanced-WAF band-aid forms ship today, all live-proven: <span class="mono">service_policy</span> (value constraint), <span class="mono">waf_data_guard</span> (response masking) and <span class="mono">api_schema</span> (API contract). <span class="mono">waf</span> (attack signatures) is declined — ASM keeps them in staging — and rate-limit / bot / malicious-user have no Advanced-WAF object (XC-only). The dropdown is driven by the emitter, so declines below say why. See <span class="mono">docs/BIGIP.md</span>.</p>
+      </details>
+      <details class="adv" id="nginxApply"><summary>Apply on your own NGINX (F5 WAF for NGINX / App Protect)</summary>
+        <div id="naStatus" class="muted" style="margin:8px 0">…</div>
+        <div class="rowf">
+          <div><label>Finding</label><select id="naFinding"></select></div>
+          <div><label>Server</label><input type="text" id="naServer" value="vpcopilot.lab" /></div>
+          <div><label>Location</label><input type="text" id="naLocation" value="/" /></div>
+          <div><label>App URL <span class="muted">— through the box</span></label><input type="text" id="naUrl" list="urlList" placeholder="http://your-nginx" /></div>
+        </div>
+        <div class="cbs">
+          <label><input type="checkbox" id="naDry" checked /> dry-run (preview only)</label>
+          <label><input type="checkbox" id="naKeep" /> keep enforcing (else roll back after a passing smoke)</label>
+        </div>
+        <button class="go" onclick="runNginxApply()">Apply on NGINX ▶</button>
+        <div id="naJob" class="jobbox" style="display:none;margin-top:10px"></div>
+        <div id="naDeclined" class="sub" style="margin-top:8px"></div>
+        <p class="sub" style="margin-top:8px">Requires <span class="mono">vpcopilot nginx-lab create</span> to have stood the copilot vhost up + NGINX SSH creds (<span class="mono">NGINX_SSH_HOST/USER/KEY</span>) in ⚙ Setup. The same three forms ship for F5 WAF for NGINX, all live-proven: <span class="mono">service_policy</span> (value constraint), <span class="mono">waf_data_guard</span> (response masking) and <span class="mono">api_schema</span> (API contract). <span class="mono">waf</span> (attack signatures) is declined — NAP keeps them in staging — and rate-limit / bot / malicious-user have no App Protect object (XC-only). The dropdown is driven by the emitter, so declines below say why. See <span class="mono">docs/design/nginx-app-protect-apply.md</span>.</p>
+      </details>
     </div>
   </section>
 
@@ -248,14 +309,16 @@
   <!-- ⑥ RETIRE -->
   <section id="retire">
     <div class="card"><h2>⑥ Retire band-aids</h2>
-      <p class="sub">Once a cure ships, detach its temporary XC control. The ledger tracks every finding found → mitigated → remediated → retired. Every band-aid also carries a <b>TTL</b> from the moment it was applied — <b>reconcile</b> walks the live ones, checks each cure PR, re-fires the exploit at the app's <b>origin</b> (around the band-aid, so a blocked request can't be mistaken for a fixed bug) and reports what it would do. It never detaches unless you tell it to.</p>
+      <p class="sub">A band-aid is a fact about your <b>infrastructure</b>, not about one scan — it stays attached until you take it off. So the live list below spans <b>every session</b>: retiring is done here, and reconcile walks these same band-aids, checks each cure PR, re-fires the exploit at the app's <b>origin</b> (around the band-aid, so a blocked request can't be mistaken for a fixed bug), and reports what it would do. It never detaches unless you tell it to. The <b>this-session</b> track underneath is just the scan you're viewing, so the two can no longer mix.</p>
       <div class="rowa">
         <button class="go ghost" style="margin-top:0" onclick="runReconcile(false)">Reconcile (report only) ▶</button>
         <button class="mini" onclick="runReconcile(true)">Reconcile &amp; retire proven fixes</button>
         <span class="muted" id="reconcileNote"></span>
       </div>
       <div id="reconcileJob" class="jobbox" style="display:none"></div>
+      <div class="kv" style="margin:16px 0 4px"><b>Live band-aids on your infrastructure</b> <span class="muted">— everything currently attached, across all sessions. Retire is here.</span></div>
       <div id="patchBox"></div>
+      <div class="kv" style="margin:18px 0 4px"><b>This session's findings</b> <span class="muted">— the found → mitigated → remediated → retired track for the scan you're viewing.</span></div>
       <div id="ledgerBox">Loading…</div>
     </div>
     <div class="card"><h2>Audit trail <span class="muted">— every change made to a load balancer</span></h2>
@@ -300,25 +363,38 @@
       <span class="muted repnote"></span>
       <pre id="xcOut" class="logbox" style="display:none"></pre>
     </div>
-    <div class="card"><h2>BIG-IP lab <span class="muted">— the appliance the declarative WAF policy is validated against (L2)</span></h2>
-      <div id="bigipStatus" class="muted">…</div>
-      <button class="go ghost" onclick="loadBigip()">Refresh</button>
-      <p class="sub" style="margin-top:8px">Set <span class="mono">BIGIP_URL</span>,
-        <span class="mono">BIGIP_USER</span> and <span class="mono">BIGIP_PASSWORD</span> above.
-        Create and remove the lab tenant with <span class="mono">vpcopilot bigip-lab create|rm</span> —
-        <span class="mono">/Common</span> is refused outright, and anything in
-        <span class="mono">VPCOPILOT_PROTECTED_BIGIP_TENANTS</span> needs an explicit override.</p>
-    </div>
-    <div class="card"><h2>Audit event sink <span class="muted">— ships every audit entry off the box as it is written</span></h2>
-      <div id="sinkStatus" class="muted">…</div>
-      <button class="go ghost" onclick="checkSink(false)">Refresh</button>
-      <button class="go" onclick="checkSink(true)">Send test event</button>
-      <p class="sub" style="margin-top:8px">Set <span class="mono">VPCOPILOT_AUDIT_SINK</span> above to
-        <span class="mono">https://…</span>, <span class="mono">syslog://host:514</span>,
-        <span class="mono">syslog:///var/run/syslog</span>, <span class="mono">stdout</span> — or
-        <span class="mono">off</span> to disable (a blank field cannot clear a key). The local
-        <span class="mono">audit.log</span> stays authoritative: a sink is a copy, never the record.</p>
-    </div>
+    <details class="adv"><summary>Advanced integrations <span class="muted">— BIG-IP &amp; NGINX labs (L2) &amp; off-box audit sink</span></summary>
+      <div class="card"><h2>BIG-IP lab <span class="muted">— the appliance the declarative WAF policy is validated against (L2)</span></h2>
+        <div id="bigipStatus" class="muted">…</div>
+        <button class="go ghost" onclick="loadBigip()">Refresh</button>
+        <p class="sub" style="margin-top:8px">Set <span class="mono">BIGIP_URL</span>,
+          <span class="mono">BIGIP_USER</span> and <span class="mono">BIGIP_PASSWORD</span> above.
+          Create and remove the lab tenant with <span class="mono">vpcopilot bigip-lab create|rm</span> —
+          <span class="mono">/Common</span> is refused outright, and anything in
+          <span class="mono">VPCOPILOT_PROTECTED_BIGIP_TENANTS</span> needs an explicit override.</p>
+      </div>
+      <div class="card"><h2>NGINX + App Protect box <span class="muted">— the box the App Protect policy is applied on (L2)</span></h2>
+        <div id="nginxSetupStatus" class="muted">…</div>
+        <button class="go ghost" onclick="loadNginx()">Refresh</button>
+        <p class="sub" style="margin-top:8px">Set <span class="mono">NGINX_SSH_HOST</span>,
+          <span class="mono">NGINX_SSH_USER</span> and <span class="mono">NGINX_SSH_KEY</span> above (SSH to
+          the box — a tunnel's near end is fine; <span class="mono">NGINX_SSH_PASSWORD</span> is the
+          key-less fallback). Stand up the copilot vhost with
+          <span class="mono">vpcopilot nginx-lab create|rm</span> — the catch-all
+          <span class="mono">_</span> server is refused, and anything in
+          <span class="mono">VPCOPILOT_PROTECTED_NGINX_SITES</span> needs an explicit override.</p>
+      </div>
+      <div class="card"><h2>Audit event sink <span class="muted">— ships every audit entry off the box as it is written</span></h2>
+        <div id="sinkStatus" class="muted">…</div>
+        <button class="go ghost" onclick="checkSink(false)">Refresh</button>
+        <button class="go" onclick="checkSink(true)">Send test event</button>
+        <p class="sub" style="margin-top:8px">Set <span class="mono">VPCOPILOT_AUDIT_SINK</span> above to
+          <span class="mono">https://…</span>, <span class="mono">syslog://host:514</span>,
+          <span class="mono">syslog:///var/run/syslog</span>, <span class="mono">stdout</span> — or
+          <span class="mono">off</span> to disable (a blank field cannot clear a key). The local
+          <span class="mono">audit.log</span> stays authoritative: a sink is a copy, never the record.</p>
+      </div>
+    </details>
     <div class="card"><h2>Agents &amp; models <span class="muted">— model-independent, per-agent in config/agents.yaml</span></h2>
       <div id="wfAgents" class="flow"></div>
     </div>
@@ -337,6 +413,16 @@ STEPS.forEach(([id,label],i)=>{
 const setupBtn=document.createElement("button"); setupBtn.className="step setup-btn"; setupBtn.id="step-setup";
 setupBtn.innerHTML='<span class="num">⚙</span><span>Setup</span>'; setupBtn.onclick=()=>show("setup"); nav.appendChild(setupBtn);
 
+// ⑦ Benchmark + the header model switcher are model-evaluation tools (internal demo). Hidden for the
+// everyday product user; shown when /api/models reports advanced (VPCOPILOT_ADVANCED or >1 config).
+function setAdvanced(on){
+  const m=document.getElementById("modelSwitch"); if(m) m.style.display=on?"flex":"none";
+  const b=document.getElementById("step-benchmark");
+  if(b){ b.style.display=on?"":"none";
+    const c=b.previousElementSibling; if(c&&c.classList.contains("conn")) c.style.display=on?"":"none"; }
+}
+setAdvanced(false);  // hidden until /api/models resolves
+
 function show(id){
   document.querySelectorAll("section").forEach(s=>s.classList.toggle("active",s.id===id));
   document.querySelectorAll(".step").forEach(b=>b.classList.toggle("active",b.id==="step-"+id));
@@ -349,7 +435,7 @@ function show(id){
   if(id==="cure"){ loadResults().then(renderCure); loadHero(); }
   if(id==="retire"){ loadLedger(); loadAudit(); loadHero(); }
   if(id==="benchmark"){ loadBenchmarks(); }
-  if(id==="setup"){ loadConfig(); loadAgents(); reportNote(); checkSink(false); loadBigip(); }
+  if(id==="setup"){ loadConfig(); loadAgents(); reportNote(); checkSink(false); loadBigip(); loadNginx(); }
 }
 // The report is rebuilt server-side on every open, so it always reflects the LATEST run — name the
 // run dir it comes from, since a scan can repoint it (out-claude-vampi, demo/out, …).
@@ -357,10 +443,12 @@ async function reportNote(){
   let out; try { out=(await jget("/api/models")).out; } catch(e){ return; }
   document.querySelectorAll(".repnote").forEach(el=>el.textContent="latest run · rebuilt from "+out+" every time you open it");
 }
-async function jget(u){ const r=await fetch(u); if(!r.ok) throw new Error((await r.json()).detail||r.statusText); return r.json(); }
+// The thrown Error carries `.status` (the HTTP code) so poll loops can tell an evicted job (404 —
+// stop) from a transient blip (keep polling). Existing handlers only read `.message` — unaffected.
+async function jget(u){ const r=await fetch(u); if(!r.ok){ const e=new Error((await r.json().catch(()=>({}))).detail||r.statusText); e.status=r.status; throw e; } return r.json(); }
 async function jpost(u,b){ const r=await fetch(u,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(b)});
-  const d=await r.json().catch(()=>({})); if(!r.ok) throw new Error(d.detail||r.statusText); return d; }
-const esc = s => (s==null?"":String(s)).replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
+  const d=await r.json().catch(()=>({})); if(!r.ok){ const e=new Error(d.detail||r.statusText); e.status=r.status; throw e; } return d; }
+const esc = s => (s==null?"":String(s)).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 // The advisory cap is the one numeric field whose falsy value MEANS something: 0 = no cap. The
 // usual `parseInt(v)||<default>` therefore turns a CLEARED box into an UNBOUNDED resolve, where
 // the CLI defaults to 25 — a two-surfaces divergence that fails in the expensive direction. Blank
@@ -386,24 +474,28 @@ function updateMode(){ const st=S();
   modeLine.textContent = `${st.dry?"dry-run":"LIVE"} · ${st.keep?"keep":"rollback"} · LB=${st.lb||"?"}` +
     (st.refine?` · refine×${st.refineAttempts}`:"") + (st.allow?" · allow-protected":""); }
 
-let RESULTS=null, IMPACT=null, DASHBOARD="";
+let RESULTS=null, IMPACT=null;
 
 // ---- hero (persistent) ----
 async function loadHero(){
   try { IMPACT = await jget("/api/impact"); } catch(e){ return; }
   const im=IMPACT;
-  if(!im.vulns){ hero.innerHTML='<span class="muted" style="color:#c7d2e8">No verified findings yet — start at ① Scan.</span>'; return; }
+  if(!im.vulns){ hero.innerHTML='<span class="muted" style="color:#cfccce">No verified findings yet — start at ① Scan.</span>'; return; }
   const mttm = im.mttm_seconds!=null ? (im.mttm_seconds+"s") : "minutes";
   const speed = im.speedup ? (" · "+im.speedup.toLocaleString()+"× faster") : "";
-  const dash = DASHBOARD ? `<a href="${DASHBOARD}" target="_blank" style="margin-left:auto;color:#fff;font-weight:700;font-size:12px">XC security dashboard ↗</a>` : "";
+  // Name where the band-aids actually run (XC / BIG-IP / NGINX), not a hardcoded "by XC".
+  const where = (im.points_live && im.points_live.length) ? " · "+im.points_live.join(", ") : "";
+  // The change-control contrast is a narrative baseline, not the user's scan data — show it only when
+  // the operator opted in (CHANGE_CONTROL_DAYS set, so /api/impact returns a non-null value).
+  const cc = im.change_control_days ? `<div class="hsep">vs</div>`+
+    `<div class="hstat dim"><div class="big redline">${im.change_control_days} days</div><div class="lbl">normal change control</div></div>` : "";
   hero.innerHTML = `
     <div class="hstat"><div class="big">${im.vulns}</div><div class="lbl">exploitable vulns</div></div>
     <div class="hsep">→</div>
-    <div class="hstat"><div class="big">${im.mitigated}</div><div class="lbl">mitigated live by XC</div></div>
+    <div class="hstat"><div class="big">${im.mitigated}</div><div class="lbl">mitigated live${esc(where)}</div></div>
     <div class="hstat"><div class="big">${mttm}</div><div class="lbl">time to mitigate${speed}</div></div>
-    <div class="hsep">vs</div>
-    <div class="hstat dim"><div class="big redline">${im.change_control_days} days</div><div class="lbl">normal change control</div></div>
-    <div class="hstat"><div class="big">${im.code_prs}</div><div class="lbl">code-fix PRs</div></div>${dash}`;
+    ${cc}
+    <div class="hstat"><div class="big">${im.code_prs}</div><div class="lbl">code-fix PRs</div></div>`;
 }
 
 // ---- shared results load + step badges ----
@@ -415,9 +507,11 @@ async function loadResults(){
 function verified(){ if(!RESULTS) return [];
   const tri=new Set((RESULTS.triage||[]).map(d=>d.finding_id));
   return (RESULTS.findings||[]).filter(f=>tri.has(f.id)); }
-function triMap(){ return Object.fromEntries((RESULTS.triage||[]).map(d=>[d.finding_id,d])); }
-function remMap(){ return Object.fromEntries((RESULTS.remediations||[]).map(r=>[r.finding_id,r])); }
-function polByFinding(){ const m={}; (RESULTS.policy_index||[]).forEach(p=>{(m[p.finding_id]=m[p.finding_id]||[]).push(p);}); return m; }
+// These deref RESULTS.* — guard on null so a failed /api/results (or a render before the first load)
+// makes the render helpers no-op with an empty map instead of throwing (only verified() guarded before).
+function triMap(){ if(!RESULTS) return {}; return Object.fromEntries((RESULTS.triage||[]).map(d=>[d.finding_id,d])); }
+function remMap(){ if(!RESULTS) return {}; return Object.fromEntries((RESULTS.remediations||[]).map(r=>[r.finding_id,r])); }
+function polByFinding(){ if(!RESULTS) return {}; const m={}; (RESULTS.policy_index||[]).forEach(p=>{(m[p.finding_id]=m[p.finding_id]||[]).push(p);}); return m; }
 function setCnt(id,n){ const el=document.getElementById("cnt-"+id); if(el){ el.textContent=n; el.style.display=n?"inline-block":"none"; } }
 function updateBadges(){
   if(!RESULTS){ return; }
@@ -481,7 +575,7 @@ function detailHTML(f,d,r,pols){
 function toggleDetail(fid){ const el=document.getElementById("det-"+fid); el.style.display = el.style.display==="none"?"table-row":"none"; }
 
 // ---- ④ mitigate (live-streamed apply) ----
-function coveredMap(){ const m={}; (RESULTS.correlations||[]).forEach(c=>{ m[c.finding_id]={control:c.control, by:c.covered_by}; }); return m; }
+function coveredMap(){ if(!RESULTS) return {}; const m={}; (RESULTS.correlations||[]).forEach(c=>{ m[c.finding_id]={control:c.control, by:c.covered_by}; }); return m; }
 function renderMitigate(){
   const tri=triMap(), pol=polByFinding(), cov=coveredMap();
   const nAll = verified().reduce((a,f)=>a+(pol[f.id]||[]).length,0);  // generated band-aids to apply
@@ -505,6 +599,8 @@ function renderMitigate(){
       <span id="mitAllProg" style="font-weight:600"></span></div>` : "";
   mitigateBox.innerHTML = rows ? bar + `<table><thead><tr><th>finding</th><th>sev</th><th>mitigate</th></tr></thead><tbody>${rows}</tbody></table>` : '<div class="empty">No verified findings — run a scan.</div>';
   loadDrift();
+  loadBigipApply();
+  loadNginxApply();
 }
 // I2: the state of the target LB *before* you click anything. Read-only — /api/drift never PUTs and
 // never writes a snapshot, so it is safe to call every time this section renders.
@@ -548,9 +644,12 @@ function applyOne(fid, control, policyName, force){
         dry_run:st.dry,keep:st.keep,refine:st.refine,refine_attempts:st.refineAttempts,allow_protected_lb:st.allow,
         allow_overbroad: !!(sim && sim.blocked_promotion), force: !!force})
     .then(job=>{
-      let n=0;  // lines already appended for this job — same full-transcript + ?since= tail as the scan log
+      let n=0, fails=0;  // lines appended + consecutive poll failures (evicted job = 404 → stop, don't spin)
       const poll=setInterval(async()=>{
-        let s; try{ s=await jget("/api/action?job="+job.job+"&since="+n); }catch(e){ return; }
+        let s; try{ s=await jget("/api/action?job="+job.job+"&since="+n); fails=0; }
+        catch(e){ if(e.status!==404 && ++fails<5) return;   // a transient blip keeps polling; a 404/persistent failure stops
+          clearInterval(poll); box.className="jobbox err";
+          statEl.textContent="error: lost the apply job ("+e.message+")"; loadHero(); resolve({ok:false}); return; }
         pushLog(logEl, s.log); n = s.log_total ?? (n + (s.log||[]).length);
         if(s.state==="running"){ statEl.textContent=`applying ${esc(control)}…`; return; }
         clearInterval(poll);
@@ -574,6 +673,125 @@ async function doApply(fid, control, policyName){
   if(!st.lb){ alert("Pick a load balancer in Run settings first."); return; }
   if(!st.dry && !confirm(`Apply ${control} for ${fid} to ${st.lb} (${st.keep?'live · KEEP':'live'})?`)) return;
   await applyOne(fid, control, policyName);
+}
+// ---- BIG-IP live-apply (L2): the same band-aid, on the operator's own Advanced WAF ----
+function loadBigipApply(){
+  const sel=document.getElementById("baFinding"); if(!sel||!RESULTS) return;
+  const u=document.getElementById("baUrl"); if(u && !u.value) u.value=S().url||"";
+  // Source of truth = the emitter. /api/emit for the bigip-awaf target returns, per finding,
+  // whether an Advanced-WAF band-aid exists (a shipped form) or an honest decline + reason —
+  // service_policy, waf_data_guard and api_schema all become selectable, and waf / rate-limit /
+  // bot / malicious-user say why they don't. A form added to the emitter shows up here for free.
+  jpost("/api/emit",{target:"bigip-awaf"}).then(d=>{
+    const results=(d&&d.results)||[];
+    const ok=results.filter(r=>r.supported), no=results.filter(r=>!r.supported);
+    sel.innerHTML = ok.map(r=>`<option value="${esc(r.finding_id)}">${esc(r.finding_id)} — ${esc(r.control)}</option>`).join("")
+      || '<option value="">— no BIG-IP Advanced-WAF band-aid in this run —</option>';
+    const dec=document.getElementById("baDeclined"); if(!dec) return;
+    const byCtrl={};
+    no.forEach(r=>{ (byCtrl[r.control]=byCtrl[r.control]||{reason:r.reason,ids:[]}).ids.push(r.finding_id); });
+    const items=Object.keys(byCtrl).sort().map(c=>
+      `<li><span class="mono">${esc(c)}</span> — ${esc(byCtrl[c].reason||"")} <span class="muted">(${byCtrl[c].ids.map(esc).join(", ")})</span></li>`).join("");
+    dec.innerHTML = items
+      ? `<b>Not applicable on BIG-IP</b> — considered and declined, not skipped:<ul style="margin:4px 0 0;padding-left:18px">${items}</ul>` : "";
+  }).catch(()=>{ sel.innerHTML='<option value="">— BIG-IP band-aids unavailable —</option>'; });
+  const box=document.getElementById("baStatus"); if(!box) return;
+  jget("/api/bigip-lab").then(d=>{
+    if(!d || d.configured===false){ box.innerHTML='<span class="muted">no BIG-IP configured — set BIGIP_URL / BIGIP_USER / BIGIP_PASSWORD in ⚙ Setup</span>'; return; }
+    if(d.reachable===false){ box.innerHTML=`<span class="nob">BIG-IP: ${esc(d.reason||"unreachable")}</span>`; return; }
+    box.innerHTML=`<span class="band">BIG-IP ready</span> · AS3 ${esc(d.as3||"")} · tenants: ${esc((d.tenants||[]).join(", ")||"none")}`;
+  }).catch(()=>{ box.innerHTML='<span class="muted">BIG-IP status unavailable</span>'; });
+}
+function runBigipApply(){
+  const fid=document.getElementById("baFinding").value;
+  if(!fid){ alert("No BIG-IP Advanced-WAF band-aid in this run to apply."); return; }
+  const tenant=(document.getElementById("baTenant").value||"vpcopilot_lab").trim();
+  const app=(document.getElementById("baApp").value||"lab").trim();
+  const url=(document.getElementById("baUrl").value||"").trim();
+  if(!url){ alert("Enter the app's URL, so the exploit can be validated against it."); return; }
+  const dry=document.getElementById("baDry").checked, keep=document.getElementById("baKeep").checked;
+  if(!dry && !confirm(`Apply on BIG-IP ${tenant}/${app} (${keep?'live · KEEP':'live · smoke'})?`)) return;
+  const box=document.getElementById("baJob"); box.style.display="block"; box.className="jobbox";
+  box.innerHTML='<div class="jobstat">starting…</div><pre class="joblog"></pre>';
+  const logEl=box.querySelector(".joblog"), statEl=box.querySelector(".jobstat");
+  jpost("/api/apply-bigip",{finding_id:fid,tenant,app,url,dry_run:dry,keep})
+  .then(job=>{
+    let n=0, fails=0;
+    const poll=setInterval(async()=>{
+      let s; try{ s=await jget("/api/action?job="+job.job+"&since="+n); fails=0; }
+      catch(e){ if(e.status!==404 && ++fails<5) return; clearInterval(poll); box.className="jobbox err"; statEl.textContent="error: lost the job ("+e.message+")"; return; }
+      pushLog(logEl, s.log); n = s.log_total ?? (n+(s.log||[]).length);
+      if(s.state==="running"){ statEl.textContent="applying on BIG-IP…"; return; }
+      clearInterval(poll);
+      if(s.state==="error"){ box.className="jobbox err"; statEl.textContent="error: "+s.error; return; }
+      const r=s.result||{}; box.className="jobbox";
+      if(r.dry_run) statEl.innerHTML='<span class="band">dry-run OK</span> — AS3 accepted the declaration; nothing changed';
+      else if(r.applied===false) statEl.innerHTML=`<span class="nob">no Advanced-WAF band-aid</span>: ${esc(r.reason||"")}`;
+      else if(r.kept) statEl.innerHTML=`<span class="band">blocked ✓ kept</span> — ${esc(r.policy_name||"")} on ${esc(tenant)}/${esc(app)}`;
+      else if(r.passed) statEl.innerHTML='<span class="band">blocked ✓</span> — rolled back (smoke test)';
+      else statEl.innerHTML='<span class="nob">did not block — rolled back</span>';
+      loadHero();
+    },1200);
+  }).catch(e=>{ box.className="jobbox err"; statEl.textContent="error: "+e.message; });
+}
+// ---- NGINX App Protect live-apply (L2): the same band-aid, on the operator's own NGINX box ----
+function loadNginxApply(){
+  const sel=document.getElementById("naFinding"); if(!sel||!RESULTS) return;
+  const u=document.getElementById("naUrl"); if(u && !u.value) u.value=S().url||"";
+  // Same source of truth as BIG-IP — /api/emit for the nginx-app-protect target. The three forms
+  // are identical across targets, so service_policy / waf_data_guard / api_schema become selectable
+  // and the rest say why they decline.
+  jpost("/api/emit",{target:"nginx-app-protect"}).then(d=>{
+    const results=(d&&d.results)||[];
+    const ok=results.filter(r=>r.supported), no=results.filter(r=>!r.supported);
+    sel.innerHTML = ok.map(r=>`<option value="${esc(r.finding_id)}">${esc(r.finding_id)} — ${esc(r.control)}</option>`).join("")
+      || '<option value="">— no NGINX App Protect band-aid in this run —</option>';
+    const dec=document.getElementById("naDeclined"); if(!dec) return;
+    const byCtrl={};
+    no.forEach(r=>{ (byCtrl[r.control]=byCtrl[r.control]||{reason:r.reason,ids:[]}).ids.push(r.finding_id); });
+    const items=Object.keys(byCtrl).sort().map(c=>
+      `<li><span class="mono">${esc(c)}</span> — ${esc(byCtrl[c].reason||"")} <span class="muted">(${byCtrl[c].ids.map(esc).join(", ")})</span></li>`).join("");
+    dec.innerHTML = items
+      ? `<b>Not applicable on NGINX</b> — considered and declined, not skipped:<ul style="margin:4px 0 0;padding-left:18px">${items}</ul>` : "";
+  }).catch(()=>{ sel.innerHTML='<option value="">— NGINX band-aids unavailable —</option>'; });
+  const box=document.getElementById("naStatus"); if(!box) return;
+  jget("/api/nginx-lab").then(d=>{
+    if(!d || d.configured===false){ box.innerHTML='<span class="muted">no NGINX box configured — set NGINX_SSH_HOST / NGINX_SSH_USER / NGINX_SSH_KEY in ⚙ Setup</span>'; return; }
+    if(d.reachable===false){ box.innerHTML=`<span class="nob">NGINX: ${esc(d.reason||"unreachable")}</span>`; return; }
+    box.innerHTML=`<span class="band">NGINX ready</span> · ${esc(d.version||"")} · App Protect ${d.app_protect?"loaded":'<span class="nob">NOT loaded</span>'}`;
+  }).catch(()=>{ box.innerHTML='<span class="muted">NGINX status unavailable</span>'; });
+}
+function runNginxApply(){
+  const fid=document.getElementById("naFinding").value;
+  if(!fid){ alert("No NGINX App Protect band-aid in this run to apply."); return; }
+  const server=(document.getElementById("naServer").value||"vpcopilot.lab").trim();
+  const location=(document.getElementById("naLocation").value||"/").trim();
+  const url=(document.getElementById("naUrl").value||"").trim();
+  if(!url){ alert("Enter the app's URL (through the box), so the exploit can be validated against it."); return; }
+  const dry=document.getElementById("naDry").checked, keep=document.getElementById("naKeep").checked;
+  if(!dry && !confirm(`Apply on NGINX ${server}${location} (${keep?'live · KEEP':'live · smoke'})?`)) return;
+  const box=document.getElementById("naJob"); box.style.display="block"; box.className="jobbox";
+  box.innerHTML='<div class="jobstat">starting…</div><pre class="joblog"></pre>';
+  const logEl=box.querySelector(".joblog"), statEl=box.querySelector(".jobstat");
+  jpost("/api/apply-nginx",{finding_id:fid,server,location,url,dry_run:dry,keep})
+  .then(job=>{
+    let n=0, fails=0;
+    const poll=setInterval(async()=>{
+      let s; try{ s=await jget("/api/action?job="+job.job+"&since="+n); fails=0; }
+      catch(e){ if(e.status!==404 && ++fails<5) return; clearInterval(poll); box.className="jobbox err"; statEl.textContent="error: lost the job ("+e.message+")"; return; }
+      pushLog(logEl, s.log); n = s.log_total ?? (n+(s.log||[]).length);
+      if(s.state==="running"){ statEl.textContent="applying on NGINX…"; return; }
+      clearInterval(poll);
+      if(s.state==="error"){ box.className="jobbox err"; statEl.textContent="error: "+s.error; return; }
+      const r=s.result||{}; box.className="jobbox";
+      if(r.dry_run) statEl.innerHTML='<span class="band">dry-run OK</span> — nginx -t accepted the policy; nothing reloaded';
+      else if(r.applied===false) statEl.innerHTML=`<span class="nob">no App Protect band-aid</span>: ${esc(r.reason||"")}`;
+      else if(r.kept) statEl.innerHTML=`<span class="band">blocked ✓ kept</span> — ${esc(r.policy_name||"")} on ${esc(server)}${esc(location)}`;
+      else if(r.passed) statEl.innerHTML='<span class="band">blocked ✓</span> — rolled back (smoke test)';
+      else statEl.innerHTML='<span class="nob">did not block — rolled back</span>';
+      loadHero();
+    },1200);
+  }).catch(e=>{ box.className="jobbox err"; statEl.textContent="error: "+e.message; });
 }
 async function doMitigateAll(){
   const pol=polByFinding(), work=[];
@@ -651,6 +869,7 @@ async function doPr(fid){
   } catch(e){ out.className="act err"; out.textContent=" "+e.message; }
 }
 async function doAllPrs(){ if(!RESULTS) await loadResults();
+  if(!RESULTS){ alert("results not loaded — run a scan first"); return; }
   const ids=(RESULTS.remediations||[]).map(r=>r.finding_id); if(!ids.length){alert("no code fixes drafted");return;}
   if(!S().dry && !confirm(`Open ${ids.length} real PRs?`)) return;
   for(const fid of ids) await doPr(fid);
@@ -704,9 +923,12 @@ async function runSimulate(){
       lb:st.lb, url:st.url, source_lb:simSourceLb.value.trim()||null, since:simSince.value.trim()||"1h",
       max_records:parseInt(simMax.value)||200});
   } catch(e){ msg.className="act err"; msg.textContent=" "+e.message; box.className="jobbox err"; return; }
-  let n=0;
+  let n=0, fails=0;
   const poll=setInterval(async()=>{
-    let s; try{ s=await jget("/api/action?job="+job.job+"&since="+n); }catch(e){ return; }
+    let s; try{ s=await jget("/api/action?job="+job.job+"&since="+n); fails=0; }
+    catch(e){ if(e.status!==404 && ++fails<5) return;   // a transient blip keeps polling; a 404/persistent failure stops
+      clearInterval(poll); box.className="jobbox err"; statEl.textContent="error: lost the simulate job ("+e.message+")";
+      msg.className="act err"; msg.textContent=" failed"; return; }
     pushLog(logEl, s.log); n = s.log_total ?? n;
     if(s.state==="running"){ statEl.textContent="simulating…"; return; }
     clearInterval(poll);
@@ -724,19 +946,18 @@ async function loadLedger(){
   let e; try { e=await jget("/api/ledger"); } catch(err){ ledgerBox.textContent="error: "+err.message; return; }
   const order={found:0,mitigated:1,remediated:2,retired:3};
   const vals=Object.values(e);
-  setCnt("retire", vals.filter(x=>x.mitigation && x.state!=="retired").length);
+  // This is the session's own progress track — read-only. Retiring a live band-aid is done in the
+  // cross-session "Live band-aids" list above (the same band-aid can belong to any session).
   const rows=vals.sort((a,b)=>(order[a.state]||0)-(order[b.state]||0)).map(x=>{
     const cure=x.cure?`<a href="${x.cure.pr_url}" target="_blank">PR #${esc(x.cure.pr_number)}</a>`:(x.has_cure?'<span class="muted">ready</span>':"—");
     const mit=x.mitigation?`${esc(x.mitigation.control)} @ ${esc(x.mitigation.lb)}`:"—";
-    const canRetire = x.mitigation && x.state!=="retired";
-    const retire = canRetire ? `<button class="mini retire" onclick="doRetire('${x.finding_id}')">Retire</button><span class="act" id="ret-${x.finding_id}"></span>` : "";
     return `<tr>
       <td><b>${esc(x.title||x.finding_id)}</b><div class="mono muted" style="font-size:11px">${esc(x.finding_id)}</div></td>
       <td>${x.severity?`<span class="pill sev-${x.severity}">${x.severity}</span>`:""}</td>
       <td>${trackHTML(x.state)}<div class="st-${x.state}" style="font-size:11px;margin-top:2px">${(x.state||"").toUpperCase()}</div></td>
-      <td>${mit}</td><td>${cure}</td><td>${retire}</td></tr>`;
+      <td>${mit}</td><td>${cure}</td></tr>`;
   }).join("");
-  ledgerBox.innerHTML = rows ? `<table><thead><tr><th>finding</th><th>sev</th><th>progress</th><th>mitigation</th><th>cure</th><th></th></tr></thead><tbody>${rows}</tbody></table>` : '<div class="empty">empty — run a scan.</div>';
+  ledgerBox.innerHTML = rows ? `<table><thead><tr><th>finding</th><th>sev</th><th>progress</th><th>mitigation</th><th>cure</th></tr></thead><tbody>${rows}</tbody></table>` : '<div class="empty">empty — run a scan.</div>';
   loadPatches();
 }
 
@@ -755,21 +976,27 @@ async function loadPatches(){
   if(!box) return;
   let d; try{ d=await jget("/api/patches"); }catch(e){ box.innerHTML=""; return; }
   const ps=(d.patches||[]);
-  if(!ps.length){ box.innerHTML=""; document.getElementById("reconcileNote").textContent="no live band-aids to reconcile."; return; }
+  setCnt("retire", ps.length);   // the step badge = live band-aids across all sessions, not just this one
+  if(!ps.length){ box.innerHTML='<div class="empty">no band-aids attached — nothing live to retire.</div>'; document.getElementById("reconcileNote").textContent="no live band-aids to reconcile."; return; }
   const overdue=ps.filter(p=>p.expired).length, escalated=ps.filter(p=>p.escalation_count).length;
   document.getElementById("reconcileNote").innerHTML =
     `${ps.length} live band-aid(s)` + (overdue?` · <span class="nob">${overdue} past TTL</span>`:"")
     + (escalated?` · <span class="nob">${escalated} escalated</span>`:"");
   const rows=ps.map(p=>{
-    const age = p.age_hours==null ? "—" : (p.age_hours/24).toFixed(1)+"d";
+    // applied date + age labels the row so a patch from another session/day can't read as this scan's.
+    const applied = p.applied_at ? esc(String(p.applied_at).slice(0,10)) : "—";
+    const age = p.age_hours==null ? "" : " · "+(p.age_hours/24).toFixed(1)+"d ago";
     const out = p.outcome ? `<span class="mono" style="font-size:11px">${esc(p.outcome)}</span>` +
       (p.reason?`<div class="muted" style="font-size:11px">${esc(p.reason)}</div>`:"") : '<span class="muted">not yet reconciled</span>';
-    return `<tr><td><span class="mono" style="font-size:11px">${esc(p.finding_id)}</span></td>
-      <td>${esc(p.control||"")} @ ${esc(p.lb||"")}</td><td>${age}</td><td>${ttlCell(p)}</td>
-      <td>${esc(p.cure_state||"none")}</td><td>${out}</td></tr>`;
+    // id keyed by finding_id + lb: the same finding_id can be live on two LBs (two rows), so the
+    // retire status span must be unique per band-aid, and doRetire must target the right one.
+    const retire = `<button class="mini retire" onclick="doRetire('${esc(p.finding_id)}','${esc(p.lb||'')}')">Retire</button><span class="act" id="${retId(p.finding_id,p.lb)}"></span>`;
+    return `<tr>
+      <td><b>${esc(p.title||p.finding_id)}</b><div class="mono muted" style="font-size:11px">${esc(p.finding_id)}</div></td>
+      <td>${esc(p.control||"")} <span class="muted">@</span> ${esc(p.lb||"")}<div class="muted" style="font-size:11px">applied ${applied}${age}</div></td>
+      <td>${ttlCell(p)}</td><td>${esc(p.cure_state||"none")}</td><td>${out}</td><td>${retire}</td></tr>`;
   }).join("");
-  box.innerHTML=`<div class="kv" style="margin:10px 0 6px"><b>Patch expiry</b></div>
-    <table><thead><tr><th>finding</th><th>band-aid</th><th>age</th><th>TTL</th><th>cure</th><th>last reconcile</th></tr></thead><tbody>${rows}</tbody></table>`;
+  box.innerHTML=`<table><thead><tr><th>finding</th><th>band-aid @ target</th><th>TTL</th><th>cure</th><th>last reconcile</th><th></th></tr></thead><tbody>${rows}</tbody></table>`;
 }
 async function runReconcile(apply){
   const box=document.getElementById("reconcileJob");
@@ -779,9 +1006,11 @@ async function runReconcile(apply){
   const logEl=box.querySelector(".joblog"), statEl=box.querySelector(".jobstat");
   let job; try{ job=await jpost("/api/reconcile",{apply:!!apply}); }
   catch(e){ box.className="jobbox err"; statEl.textContent="error: "+e.message; return; }
-  let n=0;
+  let n=0, fails=0;
   const poll=setInterval(async()=>{
-    let s; try{ s=await jget("/api/action?job="+job.job+"&since="+n); }catch(e){ return; }
+    let s; try{ s=await jget("/api/action?job="+job.job+"&since="+n); fails=0; }
+    catch(e){ if(e.status!==404 && ++fails<5) return;   // a transient blip keeps polling; a 404/persistent failure stops
+      clearInterval(poll); box.className="jobbox err"; statEl.textContent="error: lost the reconcile job ("+e.message+")"; return; }
     pushLog(logEl, s.log); n = s.log_total ?? (n + (s.log||[]).length);
     if(s.state==="running"){ statEl.textContent="reconciling…"; return; }
     clearInterval(poll);
@@ -836,31 +1065,33 @@ function renderAudit(){
 }
 function exportAudit(scope){ location.href="/api/audit-export?scope="+encodeURIComponent(scope); }
 
-async function doRetire(fid){
-  const st=S(); const out=document.getElementById("ret-"+fid);
-  if(!confirm(`Retire the band-aid for ${fid}? (detaches the live XC control${st.allow?"":"; needs allow-protected for a protected LB"})`)) return;
+// unique per band-aid (finding_id + lb), sanitized to a valid DOM id — matched by doRetire/retireAnyway.
+const retId = (fid,lb)=>"ret-"+String(fid+"@@"+(lb||"")).replace(/[^A-Za-z0-9_-]/g,"_");
+async function doRetire(fid, lb){
+  const st=S(); const out=document.getElementById(retId(fid,lb));
+  if(!confirm(`Retire the ${lb?`band-aid on ${lb}`:`band-aid`} for ${fid}? (detaches the live control${st.allow?"":"; needs allow-protected for a protected LB"})`)) return;
   out.className="act"; out.textContent=" retiring…";
   // force:false — ASK the server, do not pre-authorise. The console used to hardcode force:true,
   // which meant the "is the cure PR actually merged?" gate that the CLI and MCP enforce could not
   // be enforced from the GUI at all: every console retire skipped it. Warn-with-audited-override,
   // not a silent bypass — if the gate blocks, the operator gets the reason and an explicit button.
-  try { const r=await jpost("/api/retire",{finding_id:fid,force:false,allow_protected_lb:st.allow});
-    if(String(r.status||"").startsWith("skipped")){
+  try { const r=await jpost("/api/retire",{finding_id:fid,lb:lb,force:false,allow_protected_lb:st.allow});
+    if(String(r.status||"").startsWith("skipped")||String(r.status||"").startsWith("ambiguous")){
       out.className="act err";
-      out.innerHTML=" "+esc(r.status)+' <button class="mini" onclick="retireAnyway(\''+fid+'\')">retire anyway ▶</button>';
+      out.innerHTML=" "+esc(r.status)+' <button class="mini" onclick="retireAnyway(\''+esc(fid)+'\',\''+esc(lb||'')+'\')">retire anyway ▶</button>';
       return;
     }
-    out.className="act ok"; out.textContent=" "+(r.status||"retired"); loadLedger(); loadAudit(); loadHero();
+    out.className="act ok"; out.textContent=" "+(r.status||"retired"); loadPatches(); loadLedger(); loadAudit(); loadHero();
   } catch(e){ out.className="act err"; out.textContent=" "+e.message; }
 }
 
-async function retireAnyway(fid){
-  const st=S(); const out=document.getElementById("ret-"+fid);
+async function retireAnyway(fid, lb){
+  const st=S(); const out=document.getElementById(retId(fid,lb));
   if(!confirm(`Retire ${fid} WITHOUT a merged cure PR?\n\nThe band-aid is the only thing currently `
     + `blocking this vulnerability. Detaching it before the code fix ships re-exposes the app.`)) return;
   out.className="act"; out.textContent=" retiring (forced)…";
-  try { const r=await jpost("/api/retire",{finding_id:fid,force:true,allow_protected_lb:st.allow});
-    out.className="act ok"; out.textContent=" "+(r.status||"retired")+" (forced)"; loadLedger(); loadAudit(); loadHero();
+  try { const r=await jpost("/api/retire",{finding_id:fid,lb:lb,force:true,allow_protected_lb:st.allow});
+    out.className="act ok"; out.textContent=" "+(r.status||"retired")+" (forced)"; loadPatches(); loadLedger(); loadAudit(); loadHero();
   } catch(e){ out.className="act err"; out.textContent=" "+e.message; }
 }
 
@@ -1001,6 +1232,20 @@ async function loadBigip(){ const box=document.getElementById("bigipStatus");
   if(s.reason) bits.push('<span class="bad">'+esc(s.reason)+'</span>');
   box.innerHTML=bits.join(" · ");
 }
+async function loadNginx(){ const box=document.getElementById("nginxSetupStatus");
+  if(!box) return;
+  box.textContent="checking…";
+  let s; try { s=await jget("/api/nginx-lab"); }
+  catch(e){ box.innerHTML='<span class="bad">'+esc(e.message)+'</span>'; return; }
+  if(!s.configured){ box.innerHTML='<span class="muted">no NGINX box configured — set NGINX_SSH_HOST, NGINX_SSH_USER and NGINX_SSH_KEY above</span>'; return; }
+  if(!s.reachable){ box.innerHTML='<span class="bad">unreachable — '+esc(s.reason)+'</span>'; return; }
+  const bits=[];
+  if(s.version) bits.push(esc(s.version));
+  bits.push('App Protect: '+(s.app_protect?'<b>loaded</b>':'<span class="bad">not loaded</span>'));
+  if(s.protected&&s.protected.length) bits.push('protected: '+s.protected.map(t=>`<span class="mono">${esc(t)}</span>`).join(", "));
+  if(s.reason) bits.push('<span class="bad">'+esc(s.reason)+'</span>');
+  box.innerHTML=bits.join(" · ");
+}
 // J3 — a sink that is configured and silently not delivering is the failure this panel exists to
 // make visible: the run succeeds either way, so "unset" and "set but unreachable" must never
 // render the same. `send` is the only thing here that touches the network.
@@ -1075,8 +1320,11 @@ async function runScan(){ const repo=scanRepo.value.trim(), cve=scanCve.value.tr
   scanState.textContent="starting…";
   try { await jpost("/api/scan",{repo,cve,spec,manifest,min_severity:scanMinSeverity.value,max_advisories:advCap(scanMaxAdvisories.value),include_dev:scanIncludeDev.checked,out:scanOut.value.trim()||"out",min_confidence:parseFloat(scanMinConf.value)||0.5,max_files:parseInt(scanMaxFiles.value)||200,max_bytes:parseInt(scanMaxBytes.value)||60000,draft_code_fixes:scanRemediate.checked}); } catch(e){ scanState.textContent="error: "+e.message; return; }
   SCAN_N=0; scanLog.textContent=""; scanLogCount.textContent=""; scanLogWrap.style.display="block";
+  let fails=0;
   const poll=setInterval(async()=>{
-    let s; try { s=await jget("/api/scan?since="+SCAN_N); } catch(e){ return; }  // transient fetch blip — keep polling
+    let s; try { s=await jget("/api/scan?since="+SCAN_N); fails=0; }
+    catch(e){ if(e.status!==404 && ++fails<5) return;   // a transient fetch blip keeps polling; a 404/persistent failure stops
+      clearInterval(poll); scanState.textContent="error: lost the scan status ("+e.message+")"; return; }
     scanState.textContent="state: "+s.state;
     // a newer scan reset the buffer (log_total went backwards) — start the transcript over
     if(s.log_total < SCAN_N){ scanLog.textContent=""; SCAN_N=0; try { s=await jget("/api/scan"); } catch(e){ return; } }
@@ -1090,8 +1338,7 @@ async function runScan(){ const repo=scanRepo.value.trim(), cve=scanCve.value.tr
 
 async function loadDefaults(){ try { const d=await jget("/api/defaults");
   // Fields are NOT pre-filled — you pick them from the dropdowns (no stale/wrong defaults like a
-  // prior app's LB). Only the dashboard link + the code-fix toggle come from server config.
-  DASHBOARD=d.dashboard||"";
+  // prior app's LB). Only the code-fix toggle comes from server config.
   if(d.draft_code_fixes!==undefined) scanRemediate.checked=d.draft_code_fixes;
   } catch(e){} updateMode(); }
 
@@ -1133,7 +1380,35 @@ async function loadRepos(){
 async function loadModels(){
   try { const d=await jget("/api/models");
     modelSel.innerHTML = (d.configs||[]).map(c=>`<option value="${esc(c.tag)}" ${c.active?'selected':''}>${esc(c.tag)} — ${esc(c.model)}</option>`).join("");
+    setAdvanced(!!d.advanced);
   } catch(e){}
+}
+// ---- sessions (named workspaces) ----
+let ACTIVE_SESSION="";
+async function loadSessions(){
+  let d; try{ d=await jget("/api/sessions"); }catch(e){ return; }
+  ACTIVE_SESSION=d.active||"";
+  const sel=document.getElementById("sessionSel"); if(!sel) return;
+  sel.innerHTML=(d.sessions||[]).map(s=>{
+    const tag = s.has_results ? `${s.verified} vuln${s.verified===1?"":"s"}` : "empty";
+    const nm = (s.name && s.name!==s.id) ? `${s.name} (${s.id})` : s.id;
+    return `<option value="${esc(s.id)}"${s.active?" selected":""}>${esc(nm)} · ${esc(tag)}</option>`;
+  }).join("");
+  // a scan lands in the session you're viewing: default the output dir to the active session.
+  if(typeof scanOut!=="undefined" && scanOut && ACTIVE_SESSION) scanOut.value=ACTIVE_SESSION;
+}
+async function openSession(id){
+  if(!id || id===ACTIVE_SESSION) return;
+  try{ await jpost("/api/session",{action:"open",name:id}); }
+  catch(e){ alert("could not open session: "+e.message); loadSessions(); return; }
+  location.reload();   // hard refresh so every session-scoped tab repopulates from the new session
+}
+async function newSession(){
+  const name=prompt("Name this session (e.g. larkspur, vampi-prod):");
+  if(!name || !name.trim()) return;
+  try{ await jpost("/api/session",{action:"new",name:name.trim()}); }
+  catch(e){ alert("could not create session: "+e.message); return; }
+  location.reload();
 }
 async function setModel(tag){
   let r; try { r=await jpost("/api/model",{tag}); } catch(e){ alert("model switch failed: "+e.message); return; }
@@ -1145,6 +1420,7 @@ async function setModel(tag){
 }
 
 loadModels();
+loadSessions();                 // active session + switcher in the header (scanOut defaults to it)
 loadDefaults().then(loadLbs);   // defaults set the LB value first, then populate the picker + URL list
 loadTargets();                  // scan repo + out-dir suggestions (order-independent: never overwrite a value)
 loadRepos();                    // PR-repo suggestions (gh); silently empty if gh unavailable

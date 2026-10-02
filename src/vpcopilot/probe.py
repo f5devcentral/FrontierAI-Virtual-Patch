@@ -190,7 +190,12 @@ def probe_from_spec(target_url: str, probe: dict, log: Callable = print,
     misleading 'not blocked'."""
     with httpx.Client(base_url=target_url, timeout=15, follow_redirects=True) as c:
         token = None
-        login_path = (auth or {}).get("login_path")
+        # Default to `/api/login` exactly as `_operator_login` does, BEFORE the setup-skip check
+        # below reads it. An operator who supplies username/password with no explicit login_path
+        # still logs in at `/api/login`; without this default `login_path` stays None here, the skip
+        # never triggers, and the model's guessed `/api/login` setup fires a SECOND time — clobbering
+        # the operator's session on a cookie app.
+        login_path = (auth or {}).get("login_path") or "/api/login"
         if auth:
             token = auth.get("token") or None
             if auth.get("username") or auth.get("login_path"):
@@ -209,6 +214,36 @@ def probe_from_spec(target_url: str, probe: dict, log: Callable = print,
                 token = token or _extract_token(stext)  # Layer A: capture a token the login returned
             except Exception:  # noqa: BLE001 — setup is best-effort (e.g. login)
                 pass
+
+        # Data Guard / response-masking finding: NO request is blocked — a legitimate, authorised
+        # response leaks sensitive data (a PAN, an SSN) and the band-aid MASKS it on egress. The
+        # predicate is inverted from the block path: fire the leak request over the authed session and
+        # check whether the raw secrets still appear in the body. `exploit_blocked` here means "the
+        # harm was neutralised" (the secret is masked), so keep/rollback and the before/after log plug
+        # in unchanged. A response that is actually an ASM BLOCK page is a failure, not a mask — a
+        # masked leak must still reach the caller as a real (200, valid) response.
+        leak = probe.get("leak")
+        if leak:
+            ls, lt = _fire(c, _with_auth(leak, token))
+            blocked_page = _blocked(ls, lt)
+            present = [s for s in (probe.get("leak_secrets") or []) if s and s in (lt or "")]
+            # Masking is only OBSERVABLE on the real 2xx/3xx body that would otherwise carry the secret.
+            # A 4xx (auth required, wrong endpoint) or an ASM block page means we never saw the leak
+            # response at all — so an ABSENT secret must NOT be read as "masked": that is the same false
+            # success the block path's auth_failed guard exists to avoid (a 401 body has no PAN either).
+            # When unobserved, `exploit_blocked` stays False and `legit_ok` is False, so the loop fails
+            # closed (rolls back) and `apply_bigip` surfaces it as a fixable "couldn't observe the leak".
+            observed = ls < 400 and not blocked_page
+            masked = observed and not present
+            res = {"exploit_status": ls, "exploit_blocked": masked, "legit_ok": observed,
+                   "leak": True, "leak_observed": observed, "leak_secrets_present": present,
+                   "blocked_by_edge": blocked_page}
+            log(f"probe(finding {probe.get('finding_id', '?')}): leak {leak.get('method', 'GET')} "
+                f"{leak.get('path', '')} status={ls} "
+                f"{'masked='+str(masked) if observed else 'UNOBSERVED (status/block hid the response)'} "
+                f"(secrets exposed: {present or 'none'})")
+            return res
+
         ex = probe.get("exploit") or {}
         es, et = _fire(c, _with_auth(ex, token))
         exploit_blocked = _blocked(es, et)

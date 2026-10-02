@@ -265,6 +265,71 @@ def test_a_control_with_no_declarative_equivalent_reports_unsupported_with_a_rea
     assert control in emitters.UNSUPPORTED
 
 
+def test_waf_signatures_decline_rather_than_emit_an_inert_policy():
+    """`waf` (attack signatures) maps to a declarative policy in principle but is declined — ASM
+    stages freshly-imported signatures, so it would look applied and block nothing. It DECLINES
+    (supported=False, no policy) with a named reason, and is deliberately NOT in UNSUPPORTED (it has
+    an equivalent; it is a live-verified staging problem, not an impossibility)."""
+    r = emitters.emit(target="bigip-awaf", control="waf", policy_name="x", probe=PROBE)
+    assert r.supported is False
+    assert r.policy is None                       # a shaped-but-inert document is the failure to avoid
+    assert len(r.reason) > 40
+    assert "waf" not in emitters.UNSUPPORTED      # distinct from a control with NO equivalent at all
+
+
+def test_api_schema_emits_a_schema_valid_disallow_of_the_off_contract_endpoint():
+    """The API-contract form (live-proven 2026-08-18). A `code_only` orphan is a served-but-undocumented
+    endpoint; the band-aid disallows THAT endpoint (from the probe's exploit path) — a targeted negative
+    entry, ASM's self-contained equivalent of enforcing the OpenAPI contract for this finding."""
+    probe = {"exploit": {"method": "POST", "path": "/api/reset"},
+             "legit": {"method": "GET", "path": "/api/health"}}
+    r = emitters.emit(target="bigip-awaf", control="api_schema", policy_name="disallow-reset", probe=probe)
+    assert r.supported is True and r.policy is not None
+    url = r.policy["policy"]["urls"][0]
+    assert url["name"] == "/api/reset" and url["isAllowed"] is False   # the exact off-contract endpoint…
+    assert url["performStaging"] is False                             # …enforced immediately (no staging)
+    viol = r.policy["policy"]["blocking-settings"]["violations"]
+    assert [v for v in viol if v["name"] == "VIOL_URL" and v["block"] is True]
+    assert _validate(r.policy, "bigip-awaf-v17_1.json") == []         # schema-clean
+
+
+def test_api_schema_declines_when_no_endpoint_is_identified():
+    """The band-aid disallows the SPECIFIC endpoint the finding names — with no exploit path (and no
+    url_path) there is nothing to disallow, so it declines rather than guess a URL to block."""
+    r = emitters.emit(target="bigip-awaf", control="api_schema", policy_name="x", probe={})
+    assert r.supported is False and r.policy is None and "off-contract endpoint" in r.reason
+
+
+def test_waf_data_guard_emits_a_schema_valid_response_masking_policy():
+    """The response-masking form (live-proven 2026-08-18). It derives NOTHING from the probe — the
+    sensitive-data classes are fixed — so it emits with no exploit/legit pair, and the policy masks a
+    PAN and an SSN on egress. Validated against the vendored AWAF schema, like the value form."""
+    r = emitters.emit(target="bigip-awaf", control="waf_data_guard", policy_name="mask-profile-pii")
+    assert r.supported is True and r.policy is not None
+    dg = r.policy["policy"]["data-guard"]
+    assert dg["enabled"] is True and dg["maskData"] is True          # masks, and masking is ON…
+    assert dg["creditCardNumbers"] is True and dg["usSocialSecurityNumbers"] is True   # …PAN + SSN
+    assert dg["enforcementMode"] == "ignore-urls-in-list"            # empty list = enforce on ALL urls
+    # THE live-found trap: VIOL_DATA_GUARD must be alarm-only. block:true (the template default) makes
+    # ASM REJECT the whole response instead of masking it — schema-valid, wrong behavior.
+    viol = r.policy["policy"]["blocking-settings"]["violations"]
+    dg_viol = [v for v in viol if v["name"] == "VIOL_DATA_GUARD"]
+    assert dg_viol and dg_viol[0]["block"] is False and dg_viol[0]["alarm"] is True
+    assert _validate(r.policy, "bigip-awaf-v17_1.json") == []        # schema-clean
+
+
+def test_waf_attack_signatures_declined_because_asm_stages_them_verified_on_a_live_bigip():
+    """The attack-signature `waf` form was built and tested against a live BIG-IP (v17.5, AS3 3.56):
+    the policy imports and attaches in blocking mode, but ASM keeps freshly-imported signatures in
+    STAGING (log-only) regardless of signatureStaging / placeSignaturesInStaging /
+    enforcementReadinessPeriod=0 and a follow-up apply-policy task, so a SQLi it is meant to block
+    reaches the app. Emitting it would be a band-aid that looks applied and blocks nothing. This test
+    pins the decision AND its reason, so a future 'why not just emit signatures?' is answered in code."""
+    r = emitters.emit(target="bigip-awaf", control="waf", policy_name="x", probe=PROBE)
+    assert r.supported is False and r.policy is None
+    assert "staging" in r.reason.lower() and "signature" in r.reason.lower()
+
+
 def test_unsupported_is_never_expressible_as_an_empty_collection():
     """The reason `GeneratedArtifacts.items` already carries min_length=1: an empty collection is
     how a missing band-aid silently becomes an absent one."""
@@ -275,6 +340,32 @@ def test_unsupported_is_never_expressible_as_an_empty_collection():
         GeneratedArtifacts(items=[])
     r = emitters.emit(target="bigip-awaf", control="rate_limit", policy_name="x", probe=PROBE)
     assert r.supported is False and r.reason      # an explicit answer, not an absence
+
+
+def test_the_waf_decline_reason_is_the_shared_constant():
+    """The staging reason is a module constant so `emit` and the console / report legends that name
+    it state it once. Extracting it must not have changed what `emit` returns for the waf control —
+    this pins the two together."""
+    r = emitters.emit(target="bigip-awaf", control="waf", policy_name="x", probe=PROBE)
+    assert r.reason == emitters.WAF_STAGING_REASON
+
+
+def test_the_shipped_form_registry_agrees_with_what_emit_can_produce():
+    """AWAF_FORMS is the single source the report names the three BIG-IP forms from, so it must not
+    drift from what `emit` can actually build: every key emits a form (given data), and the declined
+    controls (`waf` + the XC-only set) are absent from it and never emit a policy. A form dropped
+    from `emit` but left in the registry — or vice-versa — fails here."""
+    assert emitters.AWAF_FORMS == {"service_policy": "value-constraint",
+                                   "waf_data_guard": "response-masking", "api_schema": "API-contract"}
+    api_probe = {"exploit": {"method": "POST", "path": "/api/reset"}}
+    probe_by = {"service_policy": PROBE, "api_schema": api_probe}     # waf_data_guard needs none
+    for control in emitters.AWAF_FORMS:
+        assert emitters.emit(target="bigip-awaf", control=control, policy_name="p",
+                             probe=probe_by.get(control)).supported is True
+    for control in ("waf", "rate_limit", "malicious_user", "bot_defense"):
+        assert control not in emitters.AWAF_FORMS
+        assert emitters.emit(target="bigip-awaf", control=control, policy_name="x",
+                             probe=PROBE).supported is False
 
 
 def test_the_xc_target_emits_the_generated_spec_unchanged():

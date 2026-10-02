@@ -220,7 +220,7 @@ def apply(
     from_scan: str = typer.Option(None, "--from-scan", help="generated policy artifact to create then apply"),
     name: str = typer.Option(None, "--name", help="override the policy name (for --from-scan)"),
     lb: str = typer.Option("vpcopilot-lab", help="HTTP LB name"),
-    url: str = typer.Option("https://lab.banknimbus.com", help="live host to validate against"),
+    url: str = typer.Option("https://your-app.example.com", envvar="VPCOPILOT_DEFAULT_URL", help="live host to validate against"),
     create_only: bool = typer.Option(False, "--create-only", help="create the policy in XC but do not attach"),
     dry_run: bool = typer.Option(False, "--dry-run", help="no mutation"),
     keep: bool = typer.Option(False, "--keep", help="leave attached on success (default: rollback)"),
@@ -293,7 +293,7 @@ def apply_ratelimit(
     burst: int = typer.Option(1, help="burst multiplier (>0)"),
     behavioral: bool = typer.Option(False, "--behavioral", help="B3: drive a burst + confirm 429s (not just config)"),
     behavioral_path: str = typer.Option("/login", "--behavioral-path", help="path to burst for --behavioral (use the rate-limited endpoint)"),
-    url: str = typer.Option("https://lab.banknimbus.com", help="live host for the behavioral burst"),
+    url: str = typer.Option("https://your-app.example.com", envvar="VPCOPILOT_DEFAULT_URL", help="live host for the behavioral burst"),
     user_id_header: str = typer.Option(None, "--user-id-header", help="key the limit per this request header (e.g. X-Agent-Id) instead of LB-wide"),
     user_id_name: str = typer.Option(None, "--user-id-name", help="user_identification object name (default <lb>-user-id)"),
     burst_header: list[str] = typer.Option(None, "--burst-header", help="header sent on every behavioral burst request, name=value (repeatable)"),
@@ -341,7 +341,7 @@ def apply_waf_cmd(
     lb: str = typer.Option("vpcopilot-lab", help="HTTP LB name"),
     app_firewall: str = typer.Option("vpcopilot-lab-waf", help="app_firewall to attach (created Blocking if missing)"),
     template: str = typer.Option("nimbus-waf", help="app_firewall to clone for the Blocking WAF"),
-    url: str = typer.Option("https://lab.banknimbus.com", help="live host to validate against"),
+    url: str = typer.Option("https://your-app.example.com", envvar="VPCOPILOT_DEFAULT_URL", help="live host to validate against"),
     finding: str = typer.Option(None, "--finding", help="link to a finding id for the ledger"),
     dry_run: bool = typer.Option(False, "--dry-run"),
     keep: bool = typer.Option(False, "--keep", help="leave WAF attached on success (default: rollback)"),
@@ -381,7 +381,7 @@ def apply_dataguard_cmd(
 @app.command(name="apply-apischema")
 def apply_apischema_cmd(
     lb: str = typer.Option("vpcopilot-lab", help="HTTP LB name"),
-    url: str = typer.Option("https://lab.banknimbus.com", help="live host to validate against"),
+    url: str = typer.Option("https://your-app.example.com", envvar="VPCOPILOT_DEFAULT_URL", help="live host to validate against"),
     openapi_file: str = typer.Option(None, "--openapi-file", help="OpenAPI/Swagger JSON to enforce (default: built-in Nimbus spec)"),
     validate_properties: str = typer.Option(
         "PROPERTY_HTTP_HEADERS,PROPERTY_QUERY_PARAMETERS,PROPERTY_HTTP_BODY", "--validate-properties",
@@ -428,7 +428,7 @@ def report(
 
 @app.command(name="lab-create")
 def lab_create(
-    domain: str = typer.Option(..., "--domain", help="hostname for the test LB, e.g. vampi.banknimbus.com"),
+    domain: str = typer.Option(..., "--domain", help="hostname for the test LB, e.g. vampi.example.com"),
     origin: str = typer.Option(..., "--origin", help="app origin host:port, e.g. 16.59.6.127:5000"),
     name: str = typer.Option(None, "--name", help="base name (default: first label of the domain)"),
     origin_tls: bool = typer.Option(False, "--origin-tls", help="origin serves HTTPS (default: HTTP)"),
@@ -450,7 +450,7 @@ def lab_create(
         f"[bold]LB[/bold]: {res['lb']}\n[bold]pool[/bold]: {res['pool']} -> {res['origin']}\n"
         f"[bold]URL[/bold]: {res['url']}", title="lab-create"))
     a, acme = res["dns_records"]["a"], res["dns_records"]["acme"]
-    rprint("\n[bold]Add these DNS records to the banknimbus.com zone:[/bold]")
+    rprint("\n[bold]Add these DNS records to the example.com zone:[/bold]")
     if a and a.get("value"):
         rprint(f"  A      {a['name']}  ->  {a['value']}")
     if acme and acme.get("value"):
@@ -702,9 +702,238 @@ def bigip_lab(
     raise typer.Exit(2)
 
 
+@app.command(name="apply-bigip")
+def apply_bigip_cmd(
+    finding: str = typer.Option(..., "--finding", help="finding id to apply the Advanced-WAF band-aid for"),
+    url: str = typer.Option(..., "--url", envvar="VPCOPILOT_DEFAULT_URL", help="the app's URL, to validate the exploit against"),
+    tenant: str = typer.Option("vpcopilot_lab", "--tenant", help="AS3 tenant the app lives in (from bigip-lab create)"),
+    app_name: str = typer.Option("lab", "--app", help="AS3 application name inside the tenant"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="ask AS3 what it would change; writes nothing"),
+    keep: bool = typer.Option(False, "--keep", help="leave the band-aid enforcing (default: roll back after a passing smoke)"),
+    allow_protected: bool = typer.Option(False, "--allow-protected-tenant", help="mutate a tenant in $VPCOPILOT_PROTECTED_BIGIP_TENANTS"),
+    out: str = typer.Option("out", "--out", help="run dir to read the band-aid from + write the audit record"),
+):
+    """Attach a finding's declarative WAF band-aid to your own BIG-IP (Advanced WAF), validate it
+    against the finding's real exploit, and roll it back if it does not block. Requires
+    `vpcopilot bigip-lab create` to have stood the tenant up first. The AS3 tenant is the blast-radius
+    boundary; `/Common` and `$VPCOPILOT_PROTECTED_BIGIP_TENANTS` are refused."""
+    from rich.markup import escape
+
+    from .bigip import BigIPError
+    from .bigip_apply import apply_bigip
+    from .bigip_lab import LabRefused
+    log = lambda m: rprint(f"[dim]{escape(str(m))}[/dim]")  # noqa: E731
+    try:
+        res = apply_bigip(finding, tenant=tenant, app=app_name, url=url, dry_run=dry_run, keep=keep,
+                          allow_protected=allow_protected, out_dir=out, log=log)
+    except LabRefused as e:
+        rprint(Panel.fit(f"[red]refused[/red]: {escape(str(e))}", title="apply-bigip"))
+        raise typer.Exit(3)
+    except (BigIPError, RuntimeError) as e:
+        rprint(Panel.fit(f"[red]appliance error[/red]: {escape(str(e))}", title="apply-bigip"))
+        raise typer.Exit(1)
+    if not res.get("applied"):
+        if res.get("dry_run"):
+            rprint(Panel.fit(f"[bold]{escape(res['policy_name'])}[/bold] would deploy to "
+                             f"{escape(tenant)}/{escape(app_name)} — [dim]dry run, nothing changed[/dim]",
+                             title="apply-bigip (dry run)"))
+        else:
+            rprint(Panel.fit(f"[yellow]no Advanced-WAF band-aid[/yellow]: {escape(res.get('reason', ''))}",
+                             title="apply-bigip"))
+        raise typer.Exit()
+    verdict = ("[green]blocked ✓ kept[/green]" if res["kept"] else
+               "[green]blocked ✓[/green] [dim]rolled back (smoke)[/dim]" if res["passed"] else
+               "[red]did not block — rolled back[/red]")
+    rprint(Panel.fit(f"[bold]finding[/bold]: {escape(finding)}\n"
+                     f"[bold]tenant[/bold]: {escape(tenant)}/{escape(app_name)}\n"
+                     f"[bold]policy[/bold]: {escape(res['policy_name'])}\n"
+                     f"[bold]result[/bold]: {verdict}", title="apply-bigip"))
+    raise typer.Exit(0 if res["passed"] else 1)
+
+
+@app.command(name="retire-bigip")
+def retire_bigip_cmd(
+    finding: str = typer.Option(..., "--finding", help="finding id whose BIG-IP band-aid to detach"),
+    tenant: str = typer.Option("vpcopilot_lab", "--tenant", help="AS3 tenant the app lives in"),
+    app_name: str = typer.Option("lab", "--app", help="AS3 application name inside the tenant"),
+    allow_protected: bool = typer.Option(False, "--allow-protected-tenant"),
+    out: str = typer.Option("out", "--out"),
+):
+    """Detach a finding's BIG-IP band-aid: redeploy the app without the WAF. The app stays up — only
+    the temporary control comes off."""
+    from rich.markup import escape
+
+    from .bigip import BigIPError
+    from .bigip_apply import retire_bigip
+    from .bigip_lab import LabRefused
+    log = lambda m: rprint(f"[dim]{escape(str(m))}[/dim]")  # noqa: E731
+    try:
+        retire_bigip(finding, tenant=tenant, app=app_name, allow_protected=allow_protected, out_dir=out, log=log)
+    except LabRefused as e:
+        rprint(Panel.fit(f"[red]refused[/red]: {escape(str(e))}", title="retire-bigip"))
+        raise typer.Exit(3)
+    except (BigIPError, RuntimeError) as e:
+        rprint(Panel.fit(f"[red]appliance error[/red]: {escape(str(e))}", title="retire-bigip"))
+        raise typer.Exit(1)
+    rprint(Panel.fit(f"[green]retired[/green] {escape(finding)} — WAF detached from "
+                     f"{escape(tenant)}/{escape(app_name)}", title="retire-bigip"))
+
+
+@app.command(name="nginx-lab")
+def nginx_lab_cmd(
+    action: str = typer.Argument(..., help="create | rm | status"),
+    server: str = typer.Option("vpcopilot.lab", "--server", help="server_name the copilot owns — the blast-radius boundary"),
+    origin: str = typer.Option(None, "--origin", help="app origin host:port the vhost proxies to, e.g. 10.30.10.22:8080 (create)"),
+    location: str = typer.Option("/", "--location", help="location the band-aid attaches to"),
+    listen: int = typer.Option(80, "--listen", help="port the vhost listens on"),
+    allow_protected: bool = typer.Option(False, "--allow-protected-site", help="mutate a server in $VPCOPILOT_PROTECTED_NGINX_SITES"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="stage + nginx -t; writes nothing"),
+    out: str = typer.Option("out", "--out", help="run directory the audit record is written to"),
+):
+    """L2: stand up (or tear down) the copilot's NGINX vhost the App Protect emitter is validated
+    against — a reverse proxy to one origin, deliberately **clean-slate** (App Protect OFF until the
+    copilot attaches a band-aid). The guard is the server_name: the catch-all `_` is refused outright,
+    and anything in `$VPCOPILOT_PROTECTED_NGINX_SITES` needs `--allow-protected-site`.
+
+        vpcopilot nginx-lab status
+        vpcopilot nginx-lab create --origin 10.30.10.22:8080 --server vpcopilot.lab
+        vpcopilot nginx-lab rm --server vpcopilot.lab
+    """
+    from rich.markup import escape
+
+    from . import nginx_lab as lab
+    from .nginx_lab import LabRefused
+    escape_ = lambda s: escape(str(s))  # noqa: E731
+    log = lambda m: rprint(f"[dim]{escape(str(m))}[/dim]")  # noqa: E731
+
+    if action == "status":
+        st = lab.status()
+        if not st["configured"]:
+            rprint(Panel.fit("[yellow]no NGINX box configured[/yellow]\n"
+                             "[dim]set NGINX_SSH_HOST / NGINX_SSH_USER / NGINX_SSH_KEY[/dim]",
+                             title="nginx-lab"))
+            raise typer.Exit()
+        if not st.get("reachable"):
+            rprint(Panel.fit(f"[red]unreachable[/red]: {escape_(st['reason'])}", title="nginx-lab"))
+            raise typer.Exit(1)
+        body = (f"[bold]nginx[/bold]: {escape_(st.get('version', ''))}\n"
+                f"[bold]App Protect[/bold]: {'loaded' if st.get('app_protect') else 'NOT loaded'}\n"
+                f"[bold]protected[/bold]: {', '.join(st.get('protected') or [])}")
+        rprint(Panel.fit(body, title="nginx-lab status"))
+        raise typer.Exit()
+
+    try:
+        if action == "create":
+            if not origin:
+                rprint("[red]--origin is required for create[/red]")
+                raise typer.Exit(2)
+            res = lab.create(server, origin, location=location, listen=listen,
+                             allow_protected=allow_protected, dry_run=dry_run, out_dir=out, log=log)
+            title = "nginx-lab create (dry run)" if dry_run else "nginx-lab create"
+            rprint(Panel.fit(f"[bold]server[/bold]: {escape(res['server'])}\n"
+                             f"[bold]URL[/bold]: {escape(res['url'])}", title=title))
+            raise typer.Exit()
+        if action == "rm":
+            res = lab.remove(server, allow_protected=allow_protected, dry_run=dry_run, out_dir=out, log=log)
+            rprint(Panel.fit(f"[bold]server[/bold]: {escape(res['server'])}\n"
+                             f"{'[dim]dry run — nothing removed[/dim]' if res.get('dry_run') else '[bold]removed[/bold]'}",
+                             title="nginx-lab rm"))
+            raise typer.Exit()
+    except typer.Exit:
+        raise
+    except LabRefused as e:
+        rprint(Panel.fit(f"[red]refused[/red]: {escape(str(e))}", title=f"nginx-lab {action}"))
+        raise typer.Exit(3)
+    except RuntimeError as e:
+        rprint(Panel.fit(f"[red]box error[/red]: {escape(str(e))}", title=f"nginx-lab {action}"))
+        raise typer.Exit(1)
+
+    rprint(f"[red]unknown action '{action}' — expected create, rm or status[/red]")
+    raise typer.Exit(2)
+
+
+@app.command(name="apply-nginx")
+def apply_nginx_cmd(
+    finding: str = typer.Option(..., "--finding", help="finding id to apply the App Protect band-aid for"),
+    url: str = typer.Option(..., "--url", envvar="VPCOPILOT_DEFAULT_URL", help="the app's URL THROUGH the box, to validate the exploit against"),
+    server: str = typer.Option("vpcopilot.lab", "--server", help="server_name the copilot owns (from nginx-lab create)"),
+    location: str = typer.Option("/", "--location", help="location to attach the band-aid to"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="stage + nginx -t; writes nothing"),
+    keep: bool = typer.Option(False, "--keep", help="leave the band-aid enforcing (default: roll back after a passing smoke)"),
+    allow_protected: bool = typer.Option(False, "--allow-protected-site", help="mutate a server in $VPCOPILOT_PROTECTED_NGINX_SITES"),
+    out: str = typer.Option("out", "--out", help="run dir to read the band-aid from + write the audit record"),
+):
+    """Attach a finding's App Protect band-aid to your own NGINX+App-Protect box, validate it against
+    the finding's real exploit, and roll it back if it does not block. Requires `vpcopilot nginx-lab
+    create` first. The server_name is the blast-radius boundary; the catch-all `_` and
+    `$VPCOPILOT_PROTECTED_NGINX_SITES` are refused."""
+    from rich.markup import escape
+
+    from .nginx import NginxError
+    from .nginx_apply import apply_nginx
+    from .nginx_lab import LabRefused
+    log = lambda m: rprint(f"[dim]{escape(str(m))}[/dim]")  # noqa: E731
+    try:
+        res = apply_nginx(finding, server=server, location=location, url=url, dry_run=dry_run,
+                          keep=keep, allow_protected=allow_protected, out_dir=out, log=log)
+    except LabRefused as e:
+        rprint(Panel.fit(f"[red]refused[/red]: {escape(str(e))}", title="apply-nginx"))
+        raise typer.Exit(3)
+    except (NginxError, RuntimeError) as e:
+        rprint(Panel.fit(f"[red]box error[/red]: {escape(str(e))}", title="apply-nginx"))
+        raise typer.Exit(1)
+    if not res.get("applied"):
+        if res.get("dry_run"):
+            rprint(Panel.fit(f"[bold]{escape(res.get('policy_name', ''))}[/bold] would deploy to "
+                             f"{escape(server)}{escape(location)} — [dim]dry run, nothing changed[/dim]",
+                             title="apply-nginx (dry run)"))
+        else:
+            rprint(Panel.fit(f"[yellow]no App Protect band-aid[/yellow]: {escape(res.get('reason', ''))}",
+                             title="apply-nginx"))
+        raise typer.Exit()
+    verdict = ("[green]blocked ✓ kept[/green]" if res["kept"] else
+               "[green]blocked ✓[/green] [dim]rolled back (smoke)[/dim]" if res["passed"] else
+               "[red]did not block — rolled back[/red]")
+    rprint(Panel.fit(f"[bold]finding[/bold]: {escape(finding)}\n"
+                     f"[bold]server[/bold]: {escape(server)}{escape(location)}\n"
+                     f"[bold]policy[/bold]: {escape(res['policy_name'])}\n"
+                     f"[bold]result[/bold]: {verdict}", title="apply-nginx"))
+    raise typer.Exit(0 if res["passed"] else 1)
+
+
+@app.command(name="retire-nginx")
+def retire_nginx_cmd(
+    finding: str = typer.Option(..., "--finding", help="finding id whose NGINX band-aid to detach"),
+    server: str = typer.Option("vpcopilot.lab", "--server", help="server_name the band-aid is on"),
+    location: str = typer.Option("/", "--location", help="location the band-aid is on"),
+    allow_protected: bool = typer.Option(False, "--allow-protected-site"),
+    out: str = typer.Option("out", "--out"),
+):
+    """Detach a finding's NGINX band-aid: remove the managed include and reload. The app stays up —
+    only the temporary control comes off."""
+    from rich.markup import escape
+
+    from .nginx import NginxError
+    from .nginx_apply import retire_nginx
+    from .nginx_lab import LabRefused
+    log = lambda m: rprint(f"[dim]{escape(str(m))}[/dim]")  # noqa: E731
+    try:
+        retire_nginx(finding, server=server, location=location, allow_protected=allow_protected,
+                     out_dir=out, log=log)
+    except LabRefused as e:
+        rprint(Panel.fit(f"[red]refused[/red]: {escape(str(e))}", title="retire-nginx"))
+        raise typer.Exit(3)
+    except (NginxError, RuntimeError) as e:
+        rprint(Panel.fit(f"[red]box error[/red]: {escape(str(e))}", title="retire-nginx"))
+        raise typer.Exit(1)
+    rprint(Panel.fit(f"[green]retired[/green] {escape(finding)} — App Protect detached from "
+                     f"{escape(server)}{escape(location)}", title="retire-nginx"))
+
+
 @app.command()
 def retire(
     finding: str = typer.Option(None, "--finding", help="retire one finding's band-aid"),
+    lb: str = typer.Option(None, "--lb", help="which LB's band-aid, when a finding is live on more than one"),
     all_findings: bool = typer.Option(False, "--all", help="retire every mitigated finding whose cure PR merged"),
     force: bool = typer.Option(False, "--force", help="skip the PR-merged check (manual retire)"),
     dry_run: bool = typer.Option(False, "--dry-run"),
@@ -716,7 +945,7 @@ def retire(
 
     logf = lambda m: rprint(f"[dim]{m}[/dim]")  # noqa: E731
     if finding:
-        results = [retire_finding(out, finding, force=force, dry_run=dry_run,
+        results = [retire_finding(out, finding, lb=lb, force=force, dry_run=dry_run,
                                   allow_protected=allow_protected_lb, log=logf)]
     elif all_findings:
         results = retire_all(out, force=force, dry_run=dry_run, allow_protected=allow_protected_lb, log=logf)
@@ -800,7 +1029,7 @@ def simulate(
     logs: str = typer.Option(None, "--logs", help="traffic sample: .har / .json (HAR) or .jsonl"),
     from_tenant: bool = typer.Option(False, "--from-tenant", help="read observed requests from XC access logs"),
     lb: str = typer.Option("vpcopilot-lab", help="spare LB to replay through (never a protected one)"),
-    url: str = typer.Option("https://lab.banknimbus.com", help="base URL of that LB"),
+    url: str = typer.Option("https://your-app.example.com", envvar="VPCOPILOT_DEFAULT_URL", help="base URL of that LB"),
     source_lb: str = typer.Option(None, "--source-lb", help="with --from-tenant: the LB whose traffic to read"),
     since: str = typer.Option("1h", "--since", help="with --from-tenant: window back from now, e.g. 30m / 6h"),
     limit: int = typer.Option(500, help="max records to pull from the tenant"),
@@ -858,9 +1087,15 @@ def _load_traffic(logs, from_tenant, source_lb, since, limit):
         srcs.append(f"file:{logs}")
     if from_tenant:
         from .xc import XC
-        n = int("".join(ch for ch in since if ch.isdigit()) or 1)
-        unit = since.strip()[-1].lower()
-        delta = _dt.timedelta(**{{"m": "minutes", "h": "hours", "d": "days"}.get(unit, "hours"): n})
+        # Require an explicit unit: `--since ""` used to IndexError on since[-1], and `--since 30`
+        # silently parsed "0" as the unit and defaulted to hours — a window the user never asked for.
+        m = re.fullmatch(r"(\d+)\s*([mhd])", since.strip().lower())
+        if not m:
+            raise typer.BadParameter(
+                f"--since {since!r}: expected a number followed by a unit m/h/d (e.g. 30m, 6h, 2d)")
+        n = int(m.group(1))
+        unit = m.group(2)
+        delta = _dt.timedelta(**{{"m": "minutes", "h": "hours", "d": "days"}[unit]: n})
         now = _dt.datetime.now(_dt.timezone.utc)
         start, end = now - delta, now
         rows = XC().access_logs(start=start.strftime("%Y-%m-%dT%H:%M:%SZ"),
